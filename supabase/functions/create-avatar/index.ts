@@ -23,7 +23,6 @@ interface GenerationResult {
   imageUrl: string;
   provider: AvatarProvider;
   kieTaskId: string | null;
-  warning: string | null;
 }
 
 serve(async (req) => {
