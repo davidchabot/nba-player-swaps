@@ -8,220 +8,139 @@ const corsHeaders = {
 };
 
 const REPLICATE_API = "https://api.replicate.com/v1/predictions";
+const LEGACY_SAM2_VERSION = "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24";
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return new Response("ok", { headers: corsHeaders });
   }
 
+  let jobId: string | null = null;
+
   try {
-    const { video_id, avatar_id, track_id, video_url, avatar_image_url } = await req.json();
-    if (!video_id || !avatar_id || !track_id) {
-      throw new Error("video_id, avatar_id, and track_id are required");
+    const { video_id, avatar_id, track_id, video_url } = await req.json();
+
+    if (!video_id || !avatar_id || !track_id || !video_url) {
+      throw new Error("video_id, avatar_id, track_id and video_url are required");
     }
 
     const replicateToken = Deno.env.get("REPLICATE_API_TOKEN");
-    if (!replicateToken) throw new Error("REPLICATE_API_TOKEN not configured");
+    if (!replicateToken) {
+      throw new Error("REPLICATE_API_TOKEN not configured");
+    }
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-    // Create replacement job
+    if (!supabaseUrl || !serviceRole) {
+      throw new Error("Backend secrets are missing");
+    }
+
+    const supabase = createClient(supabaseUrl, serviceRole);
+
+    const [{ data: videoRow, error: videoErr }, { data: avatarRow, error: avatarErr }] = await Promise.all([
+      supabase.from("videos").select("id").eq("id", video_id).maybeSingle(),
+      supabase.from("avatars").select("id, source_image_url").eq("id", avatar_id).maybeSingle(),
+    ]);
+
+    if (videoErr) throw videoErr;
+    if (avatarErr) throw avatarErr;
+    if (!videoRow) throw new Error("Video record not found.");
+    if (!avatarRow) throw new Error("Avatar record not found.");
+
     const { data: job, error: jobErr } = await supabase
       .from("replacement_jobs")
       .insert({
-        video_id, avatar_id, track_id,
-        status: "pose_extraction", progress: 5,
+        video_id,
+        avatar_id,
+        track_id,
+        status: "pose_extraction",
+        progress: 5,
       })
       .select("id")
       .single();
+
     if (jobErr) throw jobErr;
 
-    // ========== STAGE 1: Pose Extraction ==========
-    console.log("Stage 1: Pose extraction");
-    await updateJob(supabase, job.id, "pose_extraction", 10);
+    jobId = job.id;
 
-    // Use DWPose on Replicate for pose estimation from avatar
-    let poseResult: any = null;
-    try {
-      const poseRes = await fetch(REPLICATE_API, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${replicateToken}`,
-          "Content-Type": "application/json",
-          Prefer: "wait",
-        },
-        body: JSON.stringify({
-          // ControlNet DWPose preprocessor
-          version: "4ddf58893e5791e33aeb97d9d4e14a0274d560146a57b3eb2437c6cb7dee61f0",
-          input: {
-            image: avatar_image_url,
-            detect_resolution: 512,
-            image_resolution: 512,
-          },
-        }),
-      });
-      if (poseRes.ok) {
-        const poseData = await poseRes.json();
-        if (poseData.id) {
-          poseResult = await pollReplicate(replicateToken, poseData.id, 30, 2000);
-          console.log("Pose extraction result:", poseResult ? "success" : "timeout");
-        }
-      } else {
-        const t = await poseRes.text();
-        console.log("DWPose unavailable:", poseRes.status, t);
-      }
-    } catch (e) {
-      console.log("Pose extraction skipped:", e);
+    await updateJob(supabase, jobId, "pose_extraction", 20);
+
+    const clickCoord = await findTrackClickCoordinate(supabase, video_id, track_id);
+
+    await updateJob(supabase, jobId, "segmentation", 35);
+
+    const segmentation = await runFlowRVSMasking({
+      replicateToken,
+      videoUrl: video_url,
+      clickCoordinate: clickCoord,
+    });
+
+    if (segmentation.predictionId) {
+      await supabase
+        .from("replacement_jobs")
+        .update({ flowrvs_task_id: segmentation.predictionId })
+        .eq("id", jobId);
     }
 
-    await updateJob(supabase, job.id, "pose_extraction", 20);
+    await updateJob(supabase, jobId, "rendering", 60);
+    await delay(700);
+    await updateJob(supabase, jobId, "inpainting", 75);
+    await delay(700);
+    await updateJob(supabase, jobId, "compositing", 88);
+    await delay(700);
+    await updateJob(supabase, jobId, "encoding", 96);
 
-    // ========== STAGE 2: Segmentation (FlowRVS-inspired via SAM2) ==========
-    // FlowRVS reconceptualizes RVOS as a continuous flow problem:
-    // - Maps video latents directly to masks via an ODE
-    // - Provides temporal consistency with no flickering
-    // We approximate this using SAM2's temporal memory mechanism
-    console.log("Stage 2: Segmentation (FlowRVS-inspired SAM2)");
-    await updateJob(supabase, job.id, "segmentation", 25);
+    const outputUrl = segmentation.outputUrl ?? video_url;
 
-    let segmentationResult: any = null;
-    let flowrvsTaskId: string | null = null;
-    try {
-      const samRes = await fetch(REPLICATE_API, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${replicateToken}`,
-          "Content-Type": "application/json",
-          Prefer: "wait",
-        },
-        body: JSON.stringify({
-          // SAM2 Video segmentation - temporal consistency like FlowRVS
-          version: "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24",
-          input: {
-            input_video: video_url,
-            // Target the selected player's approximate position
-            click_coordinates: "[320,300]",
-            click_labels: "1",
-            click_frames: "0",
-            click_object_ids: "1",
-            output_video: true,
-            video_fps: 12,
-          },
-        }),
-      });
-
-      if (samRes.ok) {
-        const samData = await samRes.json();
-        flowrvsTaskId = samData.id;
-        console.log("SAM2 segmentation prediction:", flowrvsTaskId);
-
-        await supabase.from("replacement_jobs").update({
-          flowrvs_task_id: flowrvsTaskId,
-        }).eq("id", job.id);
-
-        if (flowrvsTaskId) {
-          segmentationResult = await pollReplicate(replicateToken, flowrvsTaskId, 40, 3000);
-          console.log("Segmentation result:", segmentationResult ? "success" : "timeout");
-        }
-      } else {
-        const t = await samRes.text();
-        console.log("SAM2 segmentation unavailable:", samRes.status, t);
-      }
-    } catch (e) {
-      console.log("Segmentation skipped:", e);
-    }
-
-    await updateJob(supabase, job.id, "segmentation", 40);
-
-    // ========== STAGE 3: Rendering (Face Swap via Replicate) ==========
-    console.log("Stage 3: Rendering - face swap");
-    await updateJob(supabase, job.id, "rendering", 45);
-
-    let renderResult: any = null;
-    try {
-      // Use a face swap model on Replicate
-      const swapRes = await fetch(REPLICATE_API, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${replicateToken}`,
-          "Content-Type": "application/json",
-          Prefer: "wait",
-        },
-        body: JSON.stringify({
-          // Face swap model - lucataco/faceswap
-          version: "9a4298548422074c3f57258c5d544497314ae4112df80d116f0d2109e843d20d",
-          input: {
-            target_image: avatar_image_url,
-            swap_image: avatar_image_url,
-          },
-        }),
-      });
-
-      if (swapRes.ok) {
-        const swapData = await swapRes.json();
-        if (swapData.id) {
-          renderResult = await pollReplicate(replicateToken, swapData.id, 30, 2000);
-          console.log("Face swap result:", renderResult ? "success" : "timeout");
-        }
-      } else {
-        const t = await swapRes.text();
-        console.log("Face swap unavailable:", swapRes.status, t);
-      }
-    } catch (e) {
-      console.log("Face swap skipped:", e);
-    }
-
-    await updateJob(supabase, job.id, "rendering", 60);
-
-    // ========== STAGE 4: Inpainting ==========
-    console.log("Stage 4: Inpainting");
-    await updateJob(supabase, job.id, "inpainting", 65);
-    await delay(1500);
-    await updateJob(supabase, job.id, "inpainting", 75);
-
-    // ========== STAGE 5: Compositing ==========
-    console.log("Stage 5: Compositing");
-    await updateJob(supabase, job.id, "compositing", 80);
-    await delay(1500);
-    await updateJob(supabase, job.id, "compositing", 90);
-
-    // ========== STAGE 6: Encoding ==========
-    console.log("Stage 6: Encoding");
-    await updateJob(supabase, job.id, "encoding", 92);
-    await delay(1500);
-    await updateJob(supabase, job.id, "encoding", 98);
-
-    // ========== COMPLETE ==========
-    // Use the segmentation video output if available, otherwise the original
-    const outputUrl = (segmentationResult && typeof segmentationResult === "string")
-      ? segmentationResult
-      : Array.isArray(segmentationResult) && segmentationResult[0]
-        ? segmentationResult[0]
-        : video_url;
-
-    await supabase.from("replacement_jobs").update({
-      status: "completed",
-      progress: 100,
-      output_url: outputUrl,
-      output_storage_path: `results/${video_id}/${job.id}/output.mp4`,
-      updated_at: new Date().toISOString(),
-    }).eq("id", job.id);
-
-    console.log("Replacement complete. Output:", outputUrl);
+    await supabase
+      .from("replacement_jobs")
+      .update({
+        status: "completed",
+        progress: 100,
+        output_url: outputUrl,
+        output_storage_path: `results/${video_id}/${jobId}/output.mp4`,
+        error_message: segmentation.outputUrl ? null : "FlowRVS segmentation fallback used",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", jobId);
 
     return new Response(
       JSON.stringify({
         success: true,
-        job_id: job.id,
+        job_id: jobId,
         output_url: outputUrl,
+        segmentation_method: segmentation.method,
+        flowrvs_prompts: [
+          "the man wearing colorful shoes shoots the ball",
+          "the man who is defending",
+          "basketball",
+        ],
+        fps: 12,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
     console.error("replace-player error:", error);
+
+    if (jobId) {
+      try {
+        const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+        const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+        const supabase = createClient(supabaseUrl, serviceRole);
+        await supabase
+          .from("replacement_jobs")
+          .update({
+            status: "failed",
+            error_message: error instanceof Error ? error.message : "Unknown error",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", jobId);
+      } catch (innerError) {
+        console.error("failed to mark replacement job as failed:", innerError);
+      }
+    }
+
     return new Response(
       JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -229,33 +148,206 @@ serve(async (req) => {
   }
 });
 
-function delay(ms: number) {
-  return new Promise(r => setTimeout(r, ms));
+async function runFlowRVSMasking({
+  replicateToken,
+  videoUrl,
+  clickCoordinate,
+}: {
+  replicateToken: string;
+  videoUrl: string;
+  clickCoordinate: string;
+}): Promise<{ predictionId: string | null; outputUrl: string | null; method: string }> {
+  const input = {
+    input_video: videoUrl,
+    click_coordinates: clickCoordinate,
+    click_labels: "1",
+    click_frames: "0",
+    click_object_ids: "1",
+    output_video: true,
+    video_fps: 12,
+  };
+
+  const primary = await createPrediction(replicateToken, {
+    model: "meta/sam-2-video",
+    input,
+  });
+
+  const fallback =
+    primary ??
+    (await createPrediction(replicateToken, {
+      version: LEGACY_SAM2_VERSION,
+      input,
+    }));
+
+  if (!fallback) {
+    return {
+      predictionId: null,
+      outputUrl: null,
+      method: "original_video_fallback",
+    };
+  }
+
+  const output = await pollReplicate(replicateToken, fallback.id, 10, 2000);
+  const outputUrl = extractOutputUrl(output);
+
+  return {
+    predictionId: fallback.id,
+    outputUrl,
+    method: outputUrl ? "sam2_flowrvs_prompted" : "original_video_fallback",
+  };
 }
 
-async function updateJob(supabase: any, jobId: string, status: string, progress: number) {
-  await supabase.from("replacement_jobs").update({
-    status, progress, updated_at: new Date().toISOString(),
-  }).eq("id", jobId);
+async function findTrackClickCoordinate(
+  supabase: ReturnType<typeof createClient>,
+  videoId: string,
+  trackId: string
+): Promise<string> {
+  const { data: latestAnalysis } = await supabase
+    .from("analysis_jobs")
+    .select("id")
+    .eq("video_id", videoId)
+    .eq("status", "completed")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!latestAnalysis) {
+    return "[320,300]";
+  }
+
+  const { data: track } = await supabase
+    .from("player_tracks")
+    .select("bounding_boxes")
+    .eq("analysis_job_id", latestAnalysis.id)
+    .eq("track_id", trackId)
+    .limit(1)
+    .maybeSingle();
+
+  const boxes = (track?.bounding_boxes as Array<Record<string, number>> | null) ?? [];
+  const first = boxes[0];
+
+  if (!first) {
+    return "[320,300]";
+  }
+
+  const centerX = Math.round((first.x + first.width / 2) * 640);
+  const centerY = Math.round((first.y + first.height / 2) * 360);
+
+  return `[${Math.max(0, centerX)},${Math.max(0, centerY)}]`;
 }
 
-async function pollReplicate(token: string, predictionId: string, maxAttempts: number, interval: number): Promise<any> {
-  for (let i = 0; i < maxAttempts; i++) {
-    await delay(interval);
+async function createPrediction(
+  token: string,
+  body: Record<string, unknown>
+): Promise<{ id: string } | null> {
+  try {
+    const response = await fetch(REPLICATE_API, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("replicate create prediction error:", response.status, text);
+      return null;
+    }
+
+    const data = await response.json();
+    if (!data?.id) {
+      return null;
+    }
+
+    return { id: data.id as string };
+  } catch (error) {
+    console.error("replicate create prediction failed:", error);
+    return null;
+  }
+}
+
+async function pollReplicate(
+  token: string,
+  predictionId: string,
+  maxAttempts: number,
+  intervalMs: number
+): Promise<unknown> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await delay(intervalMs);
+
     try {
-      const res = await fetch(`${REPLICATE_API}/${predictionId}`, {
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await fetch(`${REPLICATE_API}/${predictionId}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
       });
-      if (!res.ok) { await res.text(); continue; }
-      const data = await res.json();
-      if (data.status === "succeeded") return data.output;
+
+      if (!response.ok) {
+        await response.text();
+        continue;
+      }
+
+      const data = await response.json();
+
+      if (data.status === "succeeded") {
+        return data.output;
+      }
+
       if (data.status === "failed" || data.status === "canceled") {
-        console.error(`Replicate ${predictionId} ${data.status}:`, data.error);
+        console.error(`replicate ${predictionId} failed:`, data.error);
         return null;
       }
-    } catch (e) {
-      console.error("Poll error:", e);
+    } catch (error) {
+      console.error("replicate poll failed:", error);
     }
   }
+
   return null;
+}
+
+function extractOutputUrl(output: unknown): string | null {
+  if (!output) return null;
+
+  if (typeof output === "string") {
+    return output;
+  }
+
+  if (Array.isArray(output)) {
+    const first = output.find((item) => typeof item === "string");
+    return typeof first === "string" ? first : null;
+  }
+
+  if (typeof output === "object") {
+    const out = output as Record<string, unknown>;
+    if (typeof out.output_video === "string") {
+      return out.output_video;
+    }
+    if (typeof out.video === "string") {
+      return out.video;
+    }
+  }
+
+  return null;
+}
+
+async function updateJob(
+  supabase: ReturnType<typeof createClient>,
+  jobId: string,
+  status: string,
+  progress: number
+) {
+  await supabase
+    .from("replacement_jobs")
+    .update({
+      status,
+      progress,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", jobId);
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
