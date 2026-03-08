@@ -14,6 +14,9 @@ const FLOWRVS_PROMPTS = [
   "the man who is defending",
   "basketball",
 ];
+const REPLICATE_POLL_INTERVAL_MS = 3000;
+const REPLICATE_POLL_TIMEOUT_MS = 12 * 60 * 1000;
+const MAX_TRACK_PROMPT_POINTS = 6;
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -154,20 +157,21 @@ async function runReplacementJob({
   try {
     await updateJob(supabase, jobId, "pose_extraction", 20);
 
-    const clickCoord = await findTrackClickCoordinate(supabase, videoId, trackId);
+    const promptBundle = await findTrackPromptBundle(supabase, videoId, trackId);
 
     await updateJob(supabase, jobId, "segmentation", 35);
 
     const segmentation = await runFlowRVSMasking({
       replicateToken,
       videoUrl,
-      clickCoordinate: clickCoord,
+      promptBundle,
+      onPredictionCreated: async (predictionId) => {
+        await supabase
+          .from("replacement_jobs")
+          .update({ flowrvs_task_id: predictionId, updated_at: new Date().toISOString() })
+          .eq("id", jobId);
+      },
     });
-
-    await supabase
-      .from("replacement_jobs")
-      .update({ flowrvs_task_id: segmentation.predictionId })
-      .eq("id", jobId);
 
     await updateJob(supabase, jobId, "rendering", 60);
     await delay(700);
@@ -210,29 +214,54 @@ async function runReplacementJob({
   }
 }
 
+type TrackBoundingBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  frame?: number;
+};
+
+type PromptBundle = {
+  clickCoordinates: string;
+  clickLabels: string;
+  clickFrames: string;
+  clickObjectIds: string;
+};
+
 async function runFlowRVSMasking({
   replicateToken,
   videoUrl,
-  clickCoordinate,
+  promptBundle,
+  onPredictionCreated,
 }: {
   replicateToken: string;
   videoUrl: string;
-  clickCoordinate: string;
+  promptBundle: PromptBundle;
+  onPredictionCreated?: (predictionId: string) => Promise<void>;
 }): Promise<{ predictionId: string; outputUrl: string | null; method: string; modelUsed: string }> {
-  
-
   const input = {
     input_video: videoUrl,
-    click_coordinates: clickCoordinate,
-    click_labels: "1",
-    click_frames: "0",
-    click_object_ids: "1",
+    click_coordinates: promptBundle.clickCoordinates,
+    click_labels: promptBundle.clickLabels,
+    click_frames: promptBundle.clickFrames,
+    click_object_ids: promptBundle.clickObjectIds,
     output_video: true,
     video_fps: 12,
   };
 
   const prediction = await createPredictionExactVersion(replicateToken, input);
-  const output = await pollReplicateStrict(replicateToken, prediction.id, 45, 2500);
+
+  if (onPredictionCreated) {
+    await onPredictionCreated(prediction.id);
+  }
+
+  const output = await pollReplicateStrict(
+    replicateToken,
+    prediction.id,
+    REPLICATE_POLL_TIMEOUT_MS,
+    REPLICATE_POLL_INTERVAL_MS
+  );
   const outputUrl = extractOutputUrl(output);
 
   return {
@@ -243,11 +272,13 @@ async function runFlowRVSMasking({
   };
 }
 
-async function findTrackClickCoordinate(
+async function findTrackPromptBundle(
   supabase: ReturnType<typeof createClient>,
   videoId: string,
   trackId: string
-): Promise<string> {
+): Promise<PromptBundle> {
+  const fallbackCoordinate = "[320,300]";
+
   const { data: latestAnalysis } = await supabase
     .from("analysis_jobs")
     .select("id")
@@ -258,7 +289,12 @@ async function findTrackClickCoordinate(
     .maybeSingle();
 
   if (!latestAnalysis) {
-    return "[320,300]";
+    return {
+      clickCoordinates: fallbackCoordinate,
+      clickLabels: "1",
+      clickFrames: "0",
+      clickObjectIds: "1",
+    };
   }
 
   const { data: track } = await supabase
@@ -269,17 +305,52 @@ async function findTrackClickCoordinate(
     .limit(1)
     .maybeSingle();
 
-  const boxes = (track?.bounding_boxes as Array<Record<string, number>> | null) ?? [];
-  const first = boxes[0];
+  const rawBoxes = (track?.bounding_boxes as TrackBoundingBox[] | null) ?? [];
+  const normalizedBoxes = rawBoxes
+    .filter((box) => Number.isFinite(box?.x) && Number.isFinite(box?.y) && Number.isFinite(box?.width) && Number.isFinite(box?.height))
+    .sort((a, b) => (a.frame ?? 0) - (b.frame ?? 0));
 
-  if (!first) {
-    return "[320,300]";
+  if (normalizedBoxes.length === 0) {
+    return {
+      clickCoordinates: fallbackCoordinate,
+      clickLabels: "1",
+      clickFrames: "0",
+      clickObjectIds: "1",
+    };
   }
 
-  const centerX = Math.round((first.x + first.width / 2) * 640);
-  const centerY = Math.round((first.y + first.height / 2) * 360);
+  const stride = Math.max(1, Math.floor(normalizedBoxes.length / MAX_TRACK_PROMPT_POINTS));
+  const sampled = normalizedBoxes.filter((_, index) => index % stride === 0).slice(0, MAX_TRACK_PROMPT_POINTS);
 
-  return `[${Math.max(0, centerX)},${Math.max(0, centerY)}]`;
+  const coordinateParts: string[] = [];
+  const frameParts: string[] = [];
+
+  for (const box of sampled) {
+    const centerX = Math.round((box.x + box.width / 2) * 640);
+    const centerY = Math.round((box.y + box.height / 2) * 360);
+    coordinateParts.push(`[${Math.max(0, centerX)},${Math.max(0, centerY)}]`);
+    frameParts.push(String(Math.max(0, Math.round(box.frame ?? 0))));
+  }
+
+  if (coordinateParts.length === 0) {
+    coordinateParts.push(fallbackCoordinate);
+    frameParts.push("0");
+  }
+
+  if (frameParts[0] !== "0") {
+    coordinateParts.unshift(coordinateParts[0]);
+    frameParts.unshift("0");
+  }
+
+  const clickLabels = coordinateParts.map(() => "1").join(",");
+  const clickObjectIds = coordinateParts.map(() => "1").join(",");
+
+  return {
+    clickCoordinates: coordinateParts.join(","),
+    clickLabels,
+    clickFrames: frameParts.join(","),
+    clickObjectIds,
+  };
 }
 
 async function createPredictionExactVersion(
@@ -346,10 +417,15 @@ function parseRetryAfterSeconds(payload: string, attempt: number): number {
 async function pollReplicateStrict(
   token: string,
   predictionId: string,
-  maxAttempts: number,
+  timeoutMs: number,
   intervalMs: number
 ): Promise<unknown> {
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  const startedAt = Date.now();
+  let lastStatus = "starting";
+  let lastError: string | null = null;
+  let rateLimitRetryCount = 0;
+
+  while (Date.now() - startedAt < timeoutMs) {
     await delay(intervalMs);
 
     const response = await fetch(`${REPLICATE_API}/${predictionId}`, {
@@ -361,7 +437,8 @@ async function pollReplicateStrict(
     if (!response.ok) {
       const text = await response.text();
       if (response.status === 429) {
-        const waitSeconds = parseRetryAfterSeconds(text, attempt);
+        const waitSeconds = parseRetryAfterSeconds(text, rateLimitRetryCount);
+        rateLimitRetryCount += 1;
         await delay(waitSeconds * 1000);
         continue;
       }
@@ -372,17 +449,26 @@ async function pollReplicateStrict(
     }
 
     const data = await response.json();
+    lastStatus = typeof data.status === "string" ? data.status : "unknown";
 
-    if (data.status === "succeeded") {
+    if (typeof data.error === "string" && data.error.trim().length > 0) {
+      lastError = data.error;
+    }
+
+    if (lastStatus === "succeeded") {
       return data.output;
     }
 
-    if (data.status === "failed" || data.status === "canceled") {
-      throw new Error(`Masking prediction failed: ${data.error || "Unknown error"}`);
+    if (lastStatus === "failed" || lastStatus === "canceled") {
+      throw new Error(`Masking prediction failed: ${lastError || "Unknown error"}`);
     }
   }
 
-  throw new Error("Masking prediction timed out");
+  const timeoutMinutes = Math.round((timeoutMs / 60000) * 10) / 10;
+  const errorSuffix = lastError ? ` Last error: ${lastError}` : "";
+  throw new Error(
+    `Masking prediction timed out after ${timeoutMinutes} minutes (last status: ${lastStatus}).${errorSuffix}`
+  );
 }
 
 function extractOutputUrl(output: unknown): string | null {
