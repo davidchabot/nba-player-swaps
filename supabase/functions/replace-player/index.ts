@@ -14,6 +14,9 @@ const FLOWRVS_PROMPTS = [
   "the man who is defending",
   "basketball",
 ];
+const REPLICATE_POLL_INTERVAL_MS = 3000;
+const REPLICATE_POLL_TIMEOUT_MS = 12 * 60 * 1000;
+const MAX_TRACK_PROMPT_POINTS = 6;
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {

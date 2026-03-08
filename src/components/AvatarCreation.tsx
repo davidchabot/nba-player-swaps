@@ -104,10 +104,10 @@ export default function AvatarCreation() {
 
       // Poll for completion since generation runs in background
       let finalUrl = publicUrl;
-      let provider = "source";
       let warning: string | null = null;
+      let isCompleted = false;
 
-      for (let i = 0; i < 60; i++) {
+      for (let i = 0; i < 120; i++) {
         await new Promise((r) => setTimeout(r, 3000));
         try {
           const status = await getAvatarStatus(avatarId);
@@ -117,16 +117,23 @@ export default function AvatarCreation() {
           if (av.status === "completed") {
             finalUrl = av.source_image_url || av.thumbnail_url || publicUrl;
             warning = av.error_message;
+            isCompleted = true;
             break;
           }
+
           if (av.status === "failed") {
             throw new Error(av.error_message || "Avatar generation failed");
           }
           // Still processing, continue polling
         } catch (pollErr: any) {
-          // If it's a real error (not just polling), throw it
-          if (pollErr.message?.includes("failed")) throw pollErr;
+          if (pollErr?.message?.includes("failed") || pollErr?.message?.includes("Avatar")) {
+            throw pollErr;
+          }
         }
+      }
+
+      if (!isCompleted) {
+        throw new Error("Avatar generation timed out. Please try a clearer front-facing photo.");
       }
 
       const avatar: Avatar = {

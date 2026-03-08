@@ -14,6 +14,9 @@ const KIE_CREATE_TASK = `${KIE_BASE}/api/v1/jobs/createTask`;
 const KIE_TASK_STATUS = `${KIE_BASE}/api/v1/jobs/recordInfo`;
 const KIE_FLUX_STATUS = `${KIE_BASE}/api/v1/flux/kontext/record-info`;
 
+const KIE_POLL_INTERVAL_MS = 3000;
+const KIE_POLL_MAX_ATTEMPTS = 120;
+
 type AvatarProvider = "kie-flux-kontext" | "kie-kling-avatar" | "source";
 
 interface GenerationResult {
