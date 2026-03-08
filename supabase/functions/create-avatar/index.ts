@@ -148,7 +148,7 @@ async function runAvatarGeneration({
         thumbnail_url: result.imageUrl,
         kling_task_id: result.kieTaskId,
         status: "completed",
-        error_message: result.warning,
+        error_message: null,
         updated_at: new Date().toISOString(),
       })
       .eq("id", avatarId);
