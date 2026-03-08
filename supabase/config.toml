@@ -1,1 +1,13 @@
 project_id = "fhkeryahltcligrwezha"
+
+[functions.create-avatar]
+verify_jwt = false
+
+[functions.analyze-video]
+verify_jwt = false
+
+[functions.replace-player]
+verify_jwt = false
+
+[functions.check-job-status]
+verify_jwt = false
