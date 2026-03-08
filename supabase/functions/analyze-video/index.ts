@@ -8,7 +8,6 @@ const corsHeaders = {
 };
 
 const REPLICATE_API = "https://api.replicate.com/v1/predictions";
-const DEFAULT_TRACKING_MODEL = "meta/sam-2-video";
 const LEGACY_SAM2_VERSION = "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24";
 const FLOWRVS_PROMPTS = [
   "the man wearing colorful shoes shoots the ball",
