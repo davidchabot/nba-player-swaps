@@ -14,6 +14,8 @@ const FLOWRVS_PROMPTS = [
   "the man who is defending",
   "basketball",
 ];
+const REPLICATE_POLL_INTERVAL_MS = 3000;
+const REPLICATE_POLL_TIMEOUT_MS = 12 * 60 * 1000;
 
 type SeedPoint = { x: number; y: number };
 
