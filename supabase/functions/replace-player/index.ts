@@ -167,17 +167,10 @@ async function runFlowRVSMasking({
     video_fps: 12,
   };
 
-  const primary = await createPrediction(replicateToken, {
-    model: "meta/sam-2-video",
+  const fallback = await createPrediction(replicateToken, {
+    version: LEGACY_SAM2_VERSION,
     input,
   });
-
-  const fallback =
-    primary ??
-    (await createPrediction(replicateToken, {
-      version: LEGACY_SAM2_VERSION,
-      input,
-    }));
 
   if (!fallback) {
     return {

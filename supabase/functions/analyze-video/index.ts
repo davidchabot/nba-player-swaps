@@ -171,17 +171,10 @@ async function runFlowRVSSegmentation({
     video_fps: 12,
   };
 
-  const primary = await createPrediction(replicateToken, {
-    model: "meta/sam-2-video",
+  const fallback = await createPrediction(replicateToken, {
+    version: LEGACY_SAM2_VERSION,
     input: sam2Input,
   });
-
-  const fallback =
-    primary ??
-    (await createPrediction(replicateToken, {
-      version: LEGACY_SAM2_VERSION,
-      input: sam2Input,
-    }));
 
   if (!fallback) {
     return { predictionId: null, maskUrls: [], method: "synthetic" };
