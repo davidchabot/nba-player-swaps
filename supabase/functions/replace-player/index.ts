@@ -8,7 +8,13 @@ const corsHeaders = {
 };
 
 const REPLICATE_API = "https://api.replicate.com/v1/predictions";
+const DEFAULT_MASKING_MODEL = "meta/sam-2-video";
 const LEGACY_SAM2_VERSION = "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24";
+const FLOWRVS_PROMPTS = [
+  "the man wearing colorful shoes shoots the ball",
+  "the man who is defending",
+  "basketball",
+];
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -18,7 +24,7 @@ serve(async (req) => {
   let jobId: string | null = null;
 
   try {
-    const { video_id, avatar_id, track_id, video_url } = await req.json();
+    const { video_id, avatar_id, track_id, video_url, avatar_image_url } = await req.json();
 
     if (!video_id || !avatar_id || !track_id || !video_url) {
       throw new Error("video_id, avatar_id, track_id and video_url are required");
@@ -76,12 +82,10 @@ serve(async (req) => {
       clickCoordinate: clickCoord,
     });
 
-    if (segmentation.predictionId) {
-      await supabase
-        .from("replacement_jobs")
-        .update({ flowrvs_task_id: segmentation.predictionId })
-        .eq("id", jobId);
-    }
+    await supabase
+      .from("replacement_jobs")
+      .update({ flowrvs_task_id: segmentation.predictionId })
+      .eq("id", jobId);
 
     await updateJob(supabase, jobId, "rendering", 60);
     await delay(700);
@@ -91,16 +95,22 @@ serve(async (req) => {
     await delay(700);
     await updateJob(supabase, jobId, "encoding", 96);
 
-    const outputUrl = segmentation.outputUrl ?? video_url;
+    if (!segmentation.outputUrl) {
+      throw new Error("Masking pipeline produced no output video.");
+    }
+
+    if (segmentation.outputUrl === video_url) {
+      throw new Error("Masking output is identical to source video; replacement was aborted.");
+    }
 
     await supabase
       .from("replacement_jobs")
       .update({
         status: "completed",
         progress: 100,
-        output_url: outputUrl,
+        output_url: segmentation.outputUrl,
         output_storage_path: `results/${video_id}/${jobId}/output.mp4`,
-        error_message: segmentation.outputUrl ? null : "FlowRVS segmentation fallback used",
+        error_message: null,
         updated_at: new Date().toISOString(),
       })
       .eq("id", jobId);
@@ -109,13 +119,12 @@ serve(async (req) => {
       JSON.stringify({
         success: true,
         job_id: jobId,
-        output_url: outputUrl,
+        output_url: segmentation.outputUrl,
         segmentation_method: segmentation.method,
-        flowrvs_prompts: [
-          "the man wearing colorful shoes shoots the ball",
-          "the man who is defending",
-          "basketball",
-        ],
+        model_used: segmentation.modelUsed,
+        flowrvs_task_id: segmentation.predictionId,
+        flowrvs_prompts: FLOWRVS_PROMPTS,
+        avatar_image_used: avatar_image_url || avatarRow.source_image_url,
         fps: 12,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -156,7 +165,9 @@ async function runFlowRVSMasking({
   replicateToken: string;
   videoUrl: string;
   clickCoordinate: string;
-}): Promise<{ predictionId: string | null; outputUrl: string | null; method: string }> {
+}): Promise<{ predictionId: string; outputUrl: string | null; method: string; modelUsed: string }> {
+  const modelFromEnv = Deno.env.get("FLOWRVS_REPLICATE_MODEL")?.trim();
+
   const input = {
     input_video: videoUrl,
     click_coordinates: clickCoordinate,
@@ -167,26 +178,15 @@ async function runFlowRVSMasking({
     video_fps: 12,
   };
 
-  const fallback = await createPrediction(replicateToken, {
-    version: LEGACY_SAM2_VERSION,
-    input,
-  });
-
-  if (!fallback) {
-    return {
-      predictionId: null,
-      outputUrl: null,
-      method: "original_video_fallback",
-    };
-  }
-
-  const output = await pollReplicate(replicateToken, fallback.id, 10, 2000);
+  const prediction = await createPredictionWithFallback(replicateToken, input, modelFromEnv);
+  const output = await pollReplicateStrict(replicateToken, prediction.id, 22, 2500);
   const outputUrl = extractOutputUrl(output);
 
   return {
-    predictionId: fallback.id,
+    predictionId: prediction.id,
     outputUrl,
-    method: outputUrl ? "sam2_flowrvs_prompted" : "original_video_fallback",
+    method: outputUrl ? "sam2_flowrvs_prompted" : "sam2_no_output",
+    modelUsed: prediction.modelUsed,
   };
 }
 
@@ -229,53 +229,70 @@ async function findTrackClickCoordinate(
   return `[${Math.max(0, centerX)},${Math.max(0, centerY)}]`;
 }
 
-async function createPrediction(
+async function createPredictionWithFallback(
   token: string,
-  body: Record<string, unknown>
-): Promise<{ id: string } | null> {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  input: Record<string, unknown>,
+  envModel: string | null
+): Promise<{ id: string; modelUsed: string }> {
+  const candidateBodies: Array<{ label: string; body: Record<string, unknown> }> = [];
+
+  if (envModel) {
+    candidateBodies.push({ label: envModel, body: { model: envModel, input } });
+  }
+
+  candidateBodies.push({ label: DEFAULT_MASKING_MODEL, body: { model: DEFAULT_MASKING_MODEL, input } });
+  candidateBodies.push({ label: `version:${LEGACY_SAM2_VERSION}`, body: { version: LEGACY_SAM2_VERSION, input } });
+
+  const errors: string[] = [];
+
+  for (const candidate of candidateBodies) {
     try {
-      const response = await fetch(REPLICATE_API, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        console.error("replicate create prediction error:", response.status, text);
-
-        if (response.status === 429 && attempt === 0) {
-          await delay(3000);
-          continue;
-        }
-
-        return null;
-      }
-
-      const data = await response.json();
-      if (!data?.id) {
-        return null;
-      }
-
-      return { id: data.id as string };
+      const result = await createPredictionStrict(token, candidate.body);
+      return { id: result.id, modelUsed: candidate.label };
     } catch (error) {
-      console.error("replicate create prediction failed:", error);
-      if (attempt === 0) {
-        await delay(1000);
-        continue;
-      }
-      return null;
+      errors.push(`${candidate.label}: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   }
 
-  return null;
+  throw new Error(`No masking model could be started. ${errors.join(" | ")}`);
 }
 
-async function pollReplicate(
+async function createPredictionStrict(
+  token: string,
+  body: Record<string, unknown>
+): Promise<{ id: string }> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await fetch(REPLICATE_API, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (!data?.id) {
+        throw new Error("Replicate returned no prediction id");
+      }
+      return { id: data.id as string };
+    }
+
+    const text = await response.text();
+
+    if (response.status === 429 && attempt < 2) {
+      await delay(2000 * (attempt + 1));
+      continue;
+    }
+
+    throw new Error(`Replicate create prediction failed (${response.status}): ${text}`);
+  }
+
+  throw new Error("Replicate create prediction failed after retries");
+}
+
+async function pollReplicateStrict(
   token: string,
   predictionId: string,
   maxAttempts: number,
@@ -284,34 +301,32 @@ async function pollReplicate(
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await delay(intervalMs);
 
-    try {
-      const response = await fetch(`${REPLICATE_API}/${predictionId}`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+    const response = await fetch(`${REPLICATE_API}/${predictionId}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
 
-      if (!response.ok) {
-        await response.text();
+    if (!response.ok) {
+      const text = await response.text();
+      if (response.status >= 500) {
         continue;
       }
+      throw new Error(`Replicate poll failed (${response.status}): ${text}`);
+    }
 
-      const data = await response.json();
+    const data = await response.json();
 
-      if (data.status === "succeeded") {
-        return data.output;
-      }
+    if (data.status === "succeeded") {
+      return data.output;
+    }
 
-      if (data.status === "failed" || data.status === "canceled") {
-        console.error(`replicate ${predictionId} failed:`, data.error);
-        return null;
-      }
-    } catch (error) {
-      console.error("replicate poll failed:", error);
+    if (data.status === "failed" || data.status === "canceled") {
+      throw new Error(`Masking prediction failed: ${data.error || "Unknown error"}`);
     }
   }
 
-  return null;
+  throw new Error("Masking prediction timed out");
 }
 
 function extractOutputUrl(output: unknown): string | null {
@@ -322,17 +337,25 @@ function extractOutputUrl(output: unknown): string | null {
   }
 
   if (Array.isArray(output)) {
-    const first = output.find((item) => typeof item === "string");
+    const first = output.find((item) => typeof item === "string" && item.startsWith("http"));
     return typeof first === "string" ? first : null;
   }
 
   if (typeof output === "object") {
     const out = output as Record<string, unknown>;
-    if (typeof out.output_video === "string") {
-      return out.output_video;
-    }
-    if (typeof out.video === "string") {
-      return out.video;
+    const candidates: unknown[] = [out.output_video, out.video, out.output_url, out.result_url, out.output];
+
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.startsWith("http")) {
+        return candidate;
+      }
+
+      if (Array.isArray(candidate)) {
+        const first = candidate.find((item) => typeof item === "string" && item.startsWith("http"));
+        if (typeof first === "string") {
+          return first;
+        }
+      }
     }
   }
 
