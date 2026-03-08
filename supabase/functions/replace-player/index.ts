@@ -76,7 +76,6 @@ serve(async (req) => {
         replicateToken,
         jobId,
         videoId: video_id,
-        avatarId: avatar_id,
         trackId: track_id,
         videoUrl: video_url,
       })
@@ -139,7 +138,6 @@ async function runReplacementJob({
   replicateToken,
   jobId,
   videoId,
-  avatarId,
   trackId,
   videoUrl,
 }: {
@@ -148,7 +146,6 @@ async function runReplacementJob({
   replicateToken: string;
   jobId: string;
   videoId: string;
-  avatarId: string;
   trackId: string;
   videoUrl: string;
 }) {
