@@ -8,12 +8,7 @@ const corsHeaders = {
 };
 
 const REPLICATE_API = "https://api.replicate.com/v1/predictions";
-const SAM2_VERSION_CANDIDATES = [
-  "4cf1856c2e63670fa0a933b62c488d8321a5b5035215cf3e58a31904849deb7a",
-  "5c7d79c9c66166a605b9b615694c8f63649c2365670ed3558e72fbed6d9c80ef",
-  "1ca4e60cb71bd70813230d2cf10baf9c50882ddaa1f944b7c890ddbb32169221",
-  "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24",
-] as const;
+const FLOWRVS_SAM2_VERSION = "33432afdfc06a10da6b4018932893d39b0159f838b6d11dd1236dff85cc5ec1d";
 const FLOWRVS_PROMPTS = [
   "the man wearing colorful shoes shoots the ball",
   "the man who is defending",
@@ -90,14 +85,99 @@ serve(async (req) => {
 
     jobId = job.id;
 
-    await supabase.from("videos").update({ status: "processing" }).eq("id", video_id);
+    await supabase
+      .from("videos")
+      .update({ status: "processing", updated_at: new Date().toISOString() })
+      .eq("id", video_id);
 
+    queueBackgroundTask(
+      runAnalysisJob({
+        supabaseUrl,
+        serviceRole,
+        replicateToken,
+        jobId,
+        videoId: video_id,
+        videoUrl: video_url,
+      })
+    );
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        job_id: jobId,
+        status: "queued",
+        model_used: `meta/sam-2-video:${FLOWRVS_SAM2_VERSION}`,
+        flowrvs_prompts: FLOWRVS_PROMPTS,
+        fps: 12,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+  } catch (error) {
+    console.error("analyze-video error:", error);
+
+    try {
+      const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+      const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+      const supabase = createClient(supabaseUrl, serviceRole);
+
+      if (jobId) {
+        await failJob(supabase, jobId, error instanceof Error ? error.message : "Unknown error");
+      }
+
+      if (videoId) {
+        await supabase
+          .from("videos")
+          .update({ status: "failed", updated_at: new Date().toISOString() })
+          .eq("id", videoId);
+      }
+    } catch (innerError) {
+      console.error("failed to mark analyze state as failed:", innerError);
+    }
+
+    return new Response(
+      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+});
+
+function queueBackgroundTask(task: Promise<void>) {
+  const runtime = (globalThis as { EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void } }).EdgeRuntime;
+
+  if (runtime?.waitUntil) {
+    runtime.waitUntil(task);
+    return;
+  }
+
+  task.catch((error) => console.error("analyze-video background task error:", error));
+}
+
+async function runAnalysisJob({
+  supabaseUrl,
+  serviceRole,
+  replicateToken,
+  jobId,
+  videoId,
+  videoUrl,
+}: {
+  supabaseUrl: string;
+  serviceRole: string;
+  replicateToken: string;
+  jobId: string;
+  videoId: string;
+  videoUrl: string;
+}) {
+  const supabase = createClient(supabaseUrl, serviceRole);
+
+  try {
     await updateJob(supabase, jobId, "scene_detection", 20);
     await updateJob(supabase, jobId, "tracking", 35);
 
     const segmentation = await runFlowRVSSegmentation({
       replicateToken,
-      videoUrl: video_url,
+      videoUrl,
     });
 
     await supabase
@@ -135,50 +215,20 @@ serve(async (req) => {
       })
       .eq("id", jobId);
 
-    await supabase.from("videos").update({ status: "ready" }).eq("id", video_id);
-
-    return new Response(
-      JSON.stringify({
-        success: true,
-        job_id: jobId,
-        tracks_count: tracksCount,
-        detection_method: segmentation.method,
-        model_used: segmentation.modelUsed,
-        flowrvs_prompts: FLOWRVS_PROMPTS,
-        fps: 12,
-      }),
-      {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    await supabase
+      .from("videos")
+      .update({ status: "ready", updated_at: new Date().toISOString() })
+      .eq("id", videoId);
   } catch (error) {
-    console.error("analyze-video error:", error);
-
-    try {
-      const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-      const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-      const supabase = createClient(supabaseUrl, serviceRole);
-
-      if (jobId) {
-        await failJob(supabase, jobId, error instanceof Error ? error.message : "Unknown error");
-      }
-
-      if (videoId) {
-        await supabase
-          .from("videos")
-          .update({ status: "failed", updated_at: new Date().toISOString() })
-          .eq("id", videoId);
-      }
-    } catch (innerError) {
-      console.error("failed to mark analyze state as failed:", innerError);
-    }
-
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await failJob(supabase, jobId, message);
+    await supabase
+      .from("videos")
+      .update({ status: "failed", updated_at: new Date().toISOString() })
+      .eq("id", videoId);
+    console.error("analyze-video processing error:", error);
   }
-});
+}
 
 async function runFlowRVSSegmentation({
   replicateToken,
@@ -208,8 +258,8 @@ async function runFlowRVSSegmentation({
     video_fps: 12,
   };
 
-  const prediction = await createPredictionWithFallback(replicateToken, input);
-  const output = await pollReplicateStrict(replicateToken, prediction.id, 20, 2500);
+  const prediction = await createPredictionExactVersion(replicateToken, input);
+  const output = await pollReplicateStrict(replicateToken, prediction.id, 45, 2500);
   const maskUrls = extractMaskUrls(output);
 
   return {
@@ -221,32 +271,21 @@ async function runFlowRVSSegmentation({
   };
 }
 
-async function createPredictionWithFallback(
+async function createPredictionExactVersion(
   token: string,
   input: Record<string, unknown>
 ): Promise<{ id: string; modelUsed: string }> {
-  const versionFromEnv = Deno.env.get("FLOWRVS_REPLICATE_VERSION")?.trim();
-  const candidateVersions = Array.from(
-    new Set([...(versionFromEnv ? [versionFromEnv] : []), ...SAM2_VERSION_CANDIDATES])
-  );
-
-  const errors: string[] = [];
-
-  for (const version of candidateVersions) {
-    try {
-      const result = await createPredictionStrict(token, { version, input });
-      return { id: result.id, modelUsed: `version:${version}` };
-    } catch (error) {
-      errors.push(`version:${version}: ${error instanceof Error ? error.message : "Unknown error"}`);
-    }
-  }
-
-  throw new Error(`No masking model could be started. ${errors.join(" | ")}`);
+  const result = await createPredictionStrict(token, FLOWRVS_SAM2_VERSION, input);
+  return {
+    id: result.id,
+    modelUsed: `meta/sam-2-video:${FLOWRVS_SAM2_VERSION}`,
+  };
 }
 
 async function createPredictionStrict(
   token: string,
-  body: Record<string, unknown>
+  version: string,
+  input: Record<string, unknown>
 ): Promise<{ id: string }> {
   for (let attempt = 0; attempt < 6; attempt++) {
     const response = await fetch(REPLICATE_API, {
@@ -255,7 +294,7 @@ async function createPredictionStrict(
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ version, input }),
     });
 
     if (response.ok) {
@@ -310,6 +349,11 @@ async function pollReplicateStrict(
 
     if (!response.ok) {
       const text = await response.text();
+      if (response.status === 429) {
+        const waitSeconds = parseRetryAfterSeconds(text, attempt);
+        await delay(waitSeconds * 1000);
+        continue;
+      }
       if (response.status >= 500) {
         continue;
       }

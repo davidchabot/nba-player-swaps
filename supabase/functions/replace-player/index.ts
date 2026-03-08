@@ -8,12 +8,7 @@ const corsHeaders = {
 };
 
 const REPLICATE_API = "https://api.replicate.com/v1/predictions";
-const SAM2_VERSION_CANDIDATES = [
-  "4cf1856c2e63670fa0a933b62c488d8321a5b5035215cf3e58a31904849deb7a",
-  "5c7d79c9c66166a605b9b615694c8f63649c2365670ed3558e72fbed6d9c80ef",
-  "1ca4e60cb71bd70813230d2cf10baf9c50882ddaa1f944b7c890ddbb32169221",
-  "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24",
-] as const;
+const FLOWRVS_SAM2_VERSION = "33432afdfc06a10da6b4018932893d39b0159f838b6d11dd1236dff85cc5ec1d";
 const FLOWRVS_PROMPTS = [
   "the man wearing colorful shoes shoots the ball",
   "the man who is defending",
@@ -74,59 +69,24 @@ serve(async (req) => {
 
     jobId = job.id;
 
-    await updateJob(supabase, jobId, "pose_extraction", 20);
-
-    const clickCoord = await findTrackClickCoordinate(supabase, video_id, track_id);
-
-    await updateJob(supabase, jobId, "segmentation", 35);
-
-    const segmentation = await runFlowRVSMasking({
-      replicateToken,
-      videoUrl: video_url,
-      clickCoordinate: clickCoord,
-    });
-
-    await supabase
-      .from("replacement_jobs")
-      .update({ flowrvs_task_id: segmentation.predictionId })
-      .eq("id", jobId);
-
-    await updateJob(supabase, jobId, "rendering", 60);
-    await delay(700);
-    await updateJob(supabase, jobId, "inpainting", 75);
-    await delay(700);
-    await updateJob(supabase, jobId, "compositing", 88);
-    await delay(700);
-    await updateJob(supabase, jobId, "encoding", 96);
-
-    if (!segmentation.outputUrl) {
-      throw new Error("Masking pipeline produced no output video.");
-    }
-
-    if (segmentation.outputUrl === video_url) {
-      throw new Error("Masking output is identical to source video; replacement was aborted.");
-    }
-
-    await supabase
-      .from("replacement_jobs")
-      .update({
-        status: "completed",
-        progress: 100,
-        output_url: segmentation.outputUrl,
-        output_storage_path: `results/${video_id}/${jobId}/output.mp4`,
-        error_message: null,
-        updated_at: new Date().toISOString(),
+    queueBackgroundTask(
+      runReplacementJob({
+        supabaseUrl,
+        serviceRole,
+        replicateToken,
+        jobId,
+        videoId: video_id,
+        trackId: track_id,
+        videoUrl: video_url,
       })
-      .eq("id", jobId);
+    );
 
     return new Response(
       JSON.stringify({
         success: true,
         job_id: jobId,
-        output_url: segmentation.outputUrl,
-        segmentation_method: segmentation.method,
-        model_used: segmentation.modelUsed,
-        flowrvs_task_id: segmentation.predictionId,
+        status: "queued",
+        model_used: `meta/sam-2-video:${FLOWRVS_SAM2_VERSION}`,
         flowrvs_prompts: FLOWRVS_PROMPTS,
         avatar_image_used: avatar_image_url || avatarRow.source_image_url,
         fps: 12,
@@ -161,6 +121,95 @@ serve(async (req) => {
   }
 });
 
+function queueBackgroundTask(task: Promise<void>) {
+  const runtime = (globalThis as { EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void } }).EdgeRuntime;
+
+  if (runtime?.waitUntil) {
+    runtime.waitUntil(task);
+    return;
+  }
+
+  task.catch((error) => console.error("replace-player background task error:", error));
+}
+
+async function runReplacementJob({
+  supabaseUrl,
+  serviceRole,
+  replicateToken,
+  jobId,
+  videoId,
+  trackId,
+  videoUrl,
+}: {
+  supabaseUrl: string;
+  serviceRole: string;
+  replicateToken: string;
+  jobId: string;
+  videoId: string;
+  trackId: string;
+  videoUrl: string;
+}) {
+  const supabase = createClient(supabaseUrl, serviceRole);
+
+  try {
+    await updateJob(supabase, jobId, "pose_extraction", 20);
+
+    const clickCoord = await findTrackClickCoordinate(supabase, videoId, trackId);
+
+    await updateJob(supabase, jobId, "segmentation", 35);
+
+    const segmentation = await runFlowRVSMasking({
+      replicateToken,
+      videoUrl,
+      clickCoordinate: clickCoord,
+    });
+
+    await supabase
+      .from("replacement_jobs")
+      .update({ flowrvs_task_id: segmentation.predictionId })
+      .eq("id", jobId);
+
+    await updateJob(supabase, jobId, "rendering", 60);
+    await delay(700);
+    await updateJob(supabase, jobId, "inpainting", 75);
+    await delay(700);
+    await updateJob(supabase, jobId, "compositing", 88);
+    await delay(700);
+    await updateJob(supabase, jobId, "encoding", 96);
+
+    if (!segmentation.outputUrl) {
+      throw new Error("Masking pipeline produced no output video.");
+    }
+
+    if (segmentation.outputUrl === videoUrl) {
+      throw new Error("Masking output is identical to source video; replacement was aborted.");
+    }
+
+    await supabase
+      .from("replacement_jobs")
+      .update({
+        status: "completed",
+        progress: 100,
+        output_url: segmentation.outputUrl,
+        output_storage_path: `results/${videoId}/${jobId}/output.mp4`,
+        error_message: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", jobId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await supabase
+      .from("replacement_jobs")
+      .update({
+        status: "failed",
+        error_message: message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", jobId);
+    console.error("replace-player processing error:", error);
+  }
+}
+
 async function runFlowRVSMasking({
   replicateToken,
   videoUrl,
@@ -182,8 +231,8 @@ async function runFlowRVSMasking({
     video_fps: 12,
   };
 
-  const prediction = await createPredictionWithFallback(replicateToken, input);
-  const output = await pollReplicateStrict(replicateToken, prediction.id, 22, 2500);
+  const prediction = await createPredictionExactVersion(replicateToken, input);
+  const output = await pollReplicateStrict(replicateToken, prediction.id, 45, 2500);
   const outputUrl = extractOutputUrl(output);
 
   return {
@@ -233,32 +282,21 @@ async function findTrackClickCoordinate(
   return `[${Math.max(0, centerX)},${Math.max(0, centerY)}]`;
 }
 
-async function createPredictionWithFallback(
+async function createPredictionExactVersion(
   token: string,
   input: Record<string, unknown>
 ): Promise<{ id: string; modelUsed: string }> {
-  const versionFromEnv = Deno.env.get("FLOWRVS_REPLICATE_VERSION")?.trim();
-  const candidateVersions = Array.from(
-    new Set([...(versionFromEnv ? [versionFromEnv] : []), ...SAM2_VERSION_CANDIDATES])
-  );
-
-  const errors: string[] = [];
-
-  for (const version of candidateVersions) {
-    try {
-      const result = await createPredictionStrict(token, { version, input });
-      return { id: result.id, modelUsed: `version:${version}` };
-    } catch (error) {
-      errors.push(`version:${version}: ${error instanceof Error ? error.message : "Unknown error"}`);
-    }
-  }
-
-  throw new Error(`No masking model could be started. ${errors.join(" | ")}`);
+  const result = await createPredictionStrict(token, FLOWRVS_SAM2_VERSION, input);
+  return {
+    id: result.id,
+    modelUsed: `meta/sam-2-video:${FLOWRVS_SAM2_VERSION}`,
+  };
 }
 
 async function createPredictionStrict(
   token: string,
-  body: Record<string, unknown>
+  version: string,
+  input: Record<string, unknown>
 ): Promise<{ id: string }> {
   for (let attempt = 0; attempt < 6; attempt++) {
     const response = await fetch(REPLICATE_API, {
@@ -267,7 +305,7 @@ async function createPredictionStrict(
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ version, input }),
     });
 
     if (response.ok) {
@@ -322,6 +360,11 @@ async function pollReplicateStrict(
 
     if (!response.ok) {
       const text = await response.text();
+      if (response.status === 429) {
+        const waitSeconds = parseRetryAfterSeconds(text, attempt);
+        await delay(waitSeconds * 1000);
+        continue;
+      }
       if (response.status >= 500) {
         continue;
       }
