@@ -260,8 +260,12 @@ async function tryFluxKontextAvatar(
 
   console.log(`Flux Kontext task created: ${taskId}, polling...`);
 
-  // Poll for completion
-  const imageResultUrl = await pollKieFluxTask(apiKey, taskId, 40, 3000);
+  const imageResultUrl = await pollKieFluxTask(
+    apiKey,
+    taskId,
+    KIE_POLL_MAX_ATTEMPTS,
+    KIE_POLL_INTERVAL_MS
+  );
   if (!imageResultUrl) {
     throw new Error("Flux Kontext task completed but returned no image URL");
   }
