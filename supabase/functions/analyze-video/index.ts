@@ -194,32 +194,46 @@ async function createPrediction(
   token: string,
   body: Record<string, unknown>
 ): Promise<{ id: string } | null> {
-  try {
-    const response = await fetch(REPLICATE_API, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(REPLICATE_API, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
 
-    if (!response.ok) {
-      const text = await response.text();
-      console.error("replicate create prediction error:", response.status, text);
+      if (!response.ok) {
+        const text = await response.text();
+        console.error("replicate create prediction error:", response.status, text);
+
+        if (response.status === 429 && attempt === 0) {
+          await delay(3000);
+          continue;
+        }
+
+        return null;
+      }
+
+      const data = await response.json();
+      if (!data?.id) {
+        return null;
+      }
+
+      return { id: data.id as string };
+    } catch (error) {
+      console.error("replicate create prediction failed:", error);
+      if (attempt === 0) {
+        await delay(1000);
+        continue;
+      }
       return null;
     }
-
-    const data = await response.json();
-    if (!data?.id) {
-      return null;
-    }
-
-    return { id: data.id as string };
-  } catch (error) {
-    console.error("replicate create prediction failed:", error);
-    return null;
   }
+
+  return null;
 }
 
 function extractMaskUrls(output: unknown): string[] {
