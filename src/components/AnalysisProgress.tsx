@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { motion } from "framer-motion";
 import { Scan, Users, BarChart3, CheckCircle2 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { useApp } from "@/context/AppContext";
-import { simulateAnalysis, ANALYSIS_STAGE_LABELS } from "@/lib/mock-data";
-import { AnalysisJob } from "@/types";
+import { analyzeVideo, subscribeToAnalysisJob, getAnalysisStatus } from "@/lib/api";
+import { ANALYSIS_STAGE_LABELS } from "@/lib/mock-data";
+import { AnalysisJob, PlayerTrack } from "@/types";
+import { useToast } from "@/hooks/use-toast";
 
 const STAGE_ICONS: Record<string, React.ReactNode> = {
   pending: <Scan className="w-5 h-5" />,
@@ -22,22 +24,101 @@ const STAGES: AnalysisJob["status"][] = [
 ];
 
 export default function AnalysisProgress() {
-  const { setTracks, setCurrentStep, videoClip } = useApp();
+  const { videoDbId, videoPublicUrl, setTracks, setAnalysisJobId, setCurrentStep, videoClip } = useApp();
+  const { toast } = useToast();
   const [job, setJob] = useState<AnalysisJob | null>(null);
+  const startedRef = useRef(false);
 
   useEffect(() => {
-    const cleanup = simulateAnalysis(
-      (j) => setJob(j),
-      (j) => {
-        setJob(j);
-        if (j.result) {
-          setTracks(j.result.tracks);
-          setTimeout(() => setCurrentStep("select-player"), 1200);
-        }
+    if (startedRef.current || !videoDbId || !videoPublicUrl) return;
+    startedRef.current = true;
+
+    let unsubscribe: (() => void) | null = null;
+    let pollInterval: ReturnType<typeof setInterval> | null = null;
+
+    async function start() {
+      try {
+        // Start the analysis
+        const result = await analyzeVideo(videoDbId!, videoPublicUrl!);
+        const jobId = result.job_id;
+        setAnalysisJobId(jobId);
+
+        // Subscribe to realtime updates
+        unsubscribe = subscribeToAnalysisJob(jobId, (updatedJob) => {
+          const analysisJob: AnalysisJob = {
+            id: updatedJob.id,
+            videoClipId: updatedJob.video_id,
+            status: updatedJob.status,
+            progress: updatedJob.progress,
+          };
+          setJob(analysisJob);
+
+          if (updatedJob.status === "completed") {
+            handleCompleted(jobId);
+          } else if (updatedJob.status === "failed") {
+            toast({ title: "Analysis Failed", description: updatedJob.error_message || "Unknown error", variant: "destructive" });
+          }
+        });
+
+        // Also poll as fallback since the edge function runs synchronously
+        pollInterval = setInterval(async () => {
+          try {
+            const statusData = await getAnalysisStatus(jobId);
+            if (statusData.job) {
+              const j = statusData.job;
+              setJob({
+                id: j.id,
+                videoClipId: j.video_id,
+                status: j.status,
+                progress: j.progress,
+              });
+              if (j.status === "completed") {
+                handleCompleted(jobId);
+              }
+            }
+          } catch { /* ignore poll errors */ }
+        }, 3000);
+
+      } catch (err) {
+        console.error("Analysis start error:", err);
+        toast({
+          title: "Analysis Failed",
+          description: err instanceof Error ? err.message : "Failed to start video analysis",
+          variant: "destructive",
+        });
       }
-    );
-    return cleanup;
-  }, [setTracks, setCurrentStep]);
+    }
+
+    async function handleCompleted(jobId: string) {
+      if (pollInterval) clearInterval(pollInterval);
+      try {
+        const statusData = await getAnalysisStatus(jobId);
+        const dbTracks = statusData.tracks || [];
+        const playerTracks: PlayerTrack[] = dbTracks.map((t: any) => ({
+          trackId: t.track_id,
+          qualityScore: Number(t.quality_score),
+          coverage: Number(t.coverage),
+          stability: Number(t.stability),
+          sharpness: Number(t.sharpness),
+          occlusion: Number(t.occlusion),
+          keyframes: t.keyframes || [],
+          frameRange: [t.frame_start, t.frame_end] as [number, number],
+          boundingBoxes: t.bounding_boxes || [],
+        }));
+        setTracks(playerTracks);
+        setTimeout(() => setCurrentStep("select-player"), 1200);
+      } catch (err) {
+        console.error("Error fetching tracks:", err);
+      }
+    }
+
+    start();
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+      if (pollInterval) clearInterval(pollInterval);
+    };
+  }, [videoDbId, videoPublicUrl, setTracks, setAnalysisJobId, setCurrentStep, toast]);
 
   const overallProgress = job
     ? (() => {
@@ -53,11 +134,7 @@ export default function AnalysisProgress() {
     <div className="min-h-screen flex items-center justify-center p-6 court-pattern">
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-accent/5 blur-[120px] pointer-events-none" />
 
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="relative z-10 w-full max-w-lg"
-      >
+      <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="relative z-10 w-full max-w-lg">
         <div className="text-center mb-8">
           <span className="text-xs font-mono text-accent font-bold tracking-wider uppercase">Analyzing</span>
           <h2 className="font-display text-3xl font-bold mt-2">Detecting Players</h2>
@@ -67,7 +144,6 @@ export default function AnalysisProgress() {
         </div>
 
         <div className="glass rounded-2xl p-6 space-y-6">
-          {/* Overall progress */}
           <div className="space-y-2">
             <div className="flex justify-between text-sm">
               <span className="text-muted-foreground">Overall Progress</span>
@@ -76,7 +152,6 @@ export default function AnalysisProgress() {
             <Progress value={overallProgress} className="h-2" />
           </div>
 
-          {/* Stage list */}
           <div className="space-y-3">
             {STAGES.map((stage, i) => {
               const currentIndex = job ? STAGES.indexOf(job.status) : -1;
@@ -91,59 +166,32 @@ export default function AnalysisProgress() {
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ delay: i * 0.1 }}
                   className={`flex items-center gap-3 p-3 rounded-lg transition-colors ${
-                    isActive
-                      ? "bg-accent/10 border border-accent/20"
-                      : isDone
-                      ? "bg-success/5 border border-success/10"
-                      : "bg-secondary/30"
+                    isActive ? "bg-accent/10 border border-accent/20" : isDone ? "bg-success/5 border border-success/10" : "bg-secondary/30"
                   }`}
                 >
-                  <div
-                    className={`w-8 h-8 rounded-full flex items-center justify-center ${
-                      isActive
-                        ? "bg-accent/20 text-accent"
-                        : isDone
-                        ? "bg-success/20 text-success"
-                        : "bg-muted text-muted-foreground"
-                    }`}
-                  >
+                  <div className={`w-8 h-8 rounded-full flex items-center justify-center ${
+                    isActive ? "bg-accent/20 text-accent" : isDone ? "bg-success/20 text-success" : "bg-muted text-muted-foreground"
+                  }`}>
                     {isDone ? <CheckCircle2 className="w-4 h-4" /> : STAGE_ICONS[stage]}
                   </div>
                   <div className="flex-1">
-                    <p
-                      className={`text-sm font-medium ${
-                        isPending ? "text-muted-foreground" : "text-foreground"
-                      }`}
-                    >
+                    <p className={`text-sm font-medium ${isPending ? "text-muted-foreground" : "text-foreground"}`}>
                       {ANALYSIS_STAGE_LABELS[stage]}
                     </p>
                     {isActive && job && (
-                      <div className="mt-1">
-                        <Progress value={job.progress} className="h-1" />
-                      </div>
+                      <div className="mt-1"><Progress value={job.progress} className="h-1" /></div>
                     )}
                   </div>
-                  {isActive && (
-                    <div className="w-2 h-2 rounded-full bg-accent animate-pulse-glow" />
-                  )}
+                  {isActive && <div className="w-2 h-2 rounded-full bg-accent animate-pulse-glow" />}
                 </motion.div>
               );
             })}
           </div>
 
-          {/* Animated scanning visual */}
           <div className="relative h-32 rounded-xl overflow-hidden bg-secondary/30">
             <div className="absolute inset-0 flex items-center justify-center">
-              <motion.div
-                animate={{ rotate: 360 }}
-                transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
-                className="w-20 h-20 rounded-full border-2 border-dashed border-accent/30"
-              />
-              <motion.div
-                animate={{ scale: [1, 1.3, 1] }}
-                transition={{ duration: 2, repeat: Infinity }}
-                className="absolute w-10 h-10 rounded-full bg-accent/10"
-              />
+              <motion.div animate={{ rotate: 360 }} transition={{ duration: 3, repeat: Infinity, ease: "linear" }} className="w-20 h-20 rounded-full border-2 border-dashed border-accent/30" />
+              <motion.div animate={{ scale: [1, 1.3, 1] }} transition={{ duration: 2, repeat: Infinity }} className="absolute w-10 h-10 rounded-full bg-accent/10" />
               <Users className="absolute w-6 h-6 text-accent" />
             </div>
             <div className="absolute inset-x-0 h-px bg-gradient-to-r from-transparent via-accent to-transparent animate-scan-line" />
