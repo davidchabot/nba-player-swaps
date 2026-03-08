@@ -21,8 +21,10 @@ async function invokeFunction<TResponse>(
   }
 
   const maybeError = data as FunctionErrorPayload;
-  if (typeof maybeError?.error === "string") {
-    throw new Error(maybeError.error);
+  const functionMessage = maybeError?.error || maybeError?.message;
+  if (typeof functionMessage === "string") {
+    const details = typeof maybeError?.details === "string" ? ` (${maybeError.details})` : "";
+    throw new Error(`${functionMessage}${details}`);
   }
 
   return data as TResponse;
@@ -50,7 +52,13 @@ export async function uploadAvatarImage(file: File): Promise<string> {
 export async function createAvatar(
   imageUrl: string,
   name: string
-): Promise<{ avatar_id: string; kling_task_id?: string }> {
+): Promise<{
+  avatar_id: string;
+  avatar_image_url?: string;
+  provider?: "kling" | "lovable-ai" | "source";
+  warning?: string | null;
+  kling_task_id?: string | null;
+}> {
   return invokeFunction("create-avatar", {
     image_url: imageUrl,
     name,
