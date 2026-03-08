@@ -4,7 +4,7 @@ import { Camera, Upload, User, ArrowRight, RotateCcw, Check, Loader2 } from "luc
 import { Button } from "@/components/ui/button";
 import { useApp } from "@/context/AppContext";
 import { Avatar } from "@/types";
-import { uploadAvatarImage, createAvatar } from "@/lib/api";
+import { uploadAvatarImage, createAvatar, getAvatarStatus } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 
 type Mode = "choose" | "camera" | "upload" | "preview";
@@ -100,30 +100,55 @@ export default function AvatarCreation() {
       }
 
       const result = await createAvatar(publicUrl, avatarName || "My Avatar");
-      const finalAvatarUrl = result.avatar_image_url || publicUrl;
+      const avatarId = result.avatar_id;
+
+      // Poll for completion since generation runs in background
+      let finalUrl = publicUrl;
+      let provider = "source";
+      let warning: string | null = null;
+
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const status = await getAvatarStatus(avatarId);
+          const av = status.avatar as any;
+          if (!av) continue;
+
+          if (av.status === "completed") {
+            finalUrl = av.source_image_url || av.thumbnail_url || publicUrl;
+            warning = av.error_message;
+            break;
+          }
+          if (av.status === "failed") {
+            throw new Error(av.error_message || "Avatar generation failed");
+          }
+          // Still processing, continue polling
+        } catch (pollErr: any) {
+          // If it's a real error (not just polling), throw it
+          if (pollErr.message?.includes("failed")) throw pollErr;
+        }
+      }
 
       const avatar: Avatar = {
-        id: result.avatar_id,
+        id: avatarId,
         name: avatarName || "My Avatar",
-        sourceImageUrl: finalAvatarUrl,
-        thumbnailUrl: finalAvatarUrl,
+        sourceImageUrl: finalUrl,
+        thumbnailUrl: finalUrl,
         createdAt: new Date(),
       };
 
       setAvatar(avatar);
-      setAvatarDbId(result.avatar_id);
+      setAvatarDbId(avatarId);
 
       toast({
         title: "Avatar Created",
-        description: result.provider === "kling"
-          ? "Your 3D avatar is ready."
-          : "Your avatar was generated with fallback AI and is ready.",
+        description: "Your 3D avatar has been generated and is ready.",
       });
 
-      if (result.warning) {
+      if (warning) {
         toast({
           title: "Generation note",
-          description: result.warning,
+          description: warning,
         });
       }
 

@@ -7,15 +7,19 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const KLING_GENERATIONS_URL = "https://api.klingai.com/v1/images/generations";
-const LOVABLE_AI_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
+// KIE API endpoints
+const KIE_BASE = "https://api.kie.ai";
+const KIE_FLUX_KONTEXT = `${KIE_BASE}/api/v1/flux/kontext/generate`;
+const KIE_CREATE_TASK = `${KIE_BASE}/api/v1/jobs/createTask`;
+const KIE_TASK_STATUS = `${KIE_BASE}/api/v1/jobs/recordInfo`;
+const KIE_FLUX_STATUS = `${KIE_BASE}/api/v1/flux/kontext/record-info`;
 
-type AvatarProvider = "kling" | "lovable-ai" | "source";
+type AvatarProvider = "kie-flux-kontext" | "kie-kling-avatar" | "source";
 
 interface GenerationResult {
   imageUrl: string;
   provider: AvatarProvider;
-  klingTaskId: string | null;
+  kieTaskId: string | null;
   warning: string | null;
 }
 
@@ -30,10 +34,12 @@ serve(async (req) => {
     const { image_url, name } = await req.json();
     if (!image_url) throw new Error("image_url is required");
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    const kieApiKey = Deno.env.get("KIE_API_KEY");
+    if (!kieApiKey) throw new Error("KIE_API_KEY is not configured. Please add your KIE API key.");
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, serviceRole);
 
     const { data: avatar, error: insertErr } = await supabase
       .from("avatars")
@@ -47,39 +53,25 @@ serve(async (req) => {
       .single();
 
     if (insertErr) throw insertErr;
-
     avatarId = avatar.id;
 
-    const result = await generateBestAvatar({
-      baseImageUrl: image_url,
-      displayName: name || "My Avatar",
-      avatarId,
-      supabase,
-    });
-
-    const { error: updateErr } = await supabase
-      .from("avatars")
-      .update({
-        source_image_url: result.imageUrl,
-        thumbnail_url: result.imageUrl,
-        kling_task_id: result.klingTaskId,
-        status: "completed",
-        error_message: result.warning,
-        updated_at: new Date().toISOString(),
+    // Run generation in background to avoid HTTP timeout
+    queueBackgroundTask(
+      runAvatarGeneration({
+        supabaseUrl,
+        serviceRole,
+        kieApiKey,
+        avatarId,
+        imageUrl: image_url,
+        displayName: name || "My Avatar",
       })
-      .eq("id", avatarId);
-
-    if (updateErr) throw updateErr;
+    );
 
     return new Response(
       JSON.stringify({
         success: true,
         avatar_id: avatarId,
-        avatar_image_url: result.imageUrl,
-        provider: result.provider,
-        warning: result.warning,
-        kling_task_id: result.klingTaskId,
-        status: "completed",
+        status: "processing",
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
@@ -92,7 +84,6 @@ serve(async (req) => {
           Deno.env.get("SUPABASE_URL")!,
           Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
         );
-
         await supabase
           .from("avatars")
           .update({
@@ -113,289 +104,317 @@ serve(async (req) => {
   }
 });
 
-async function generateBestAvatar({
+function queueBackgroundTask(task: Promise<void>) {
+  const runtime = (globalThis as { EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void } }).EdgeRuntime;
+  if (runtime?.waitUntil) {
+    runtime.waitUntil(task);
+    return;
+  }
+  task.catch((error) => console.error("create-avatar background task error:", error));
+}
+
+async function runAvatarGeneration({
+  supabaseUrl,
+  serviceRole,
+  kieApiKey,
+  avatarId,
+  imageUrl,
+  displayName,
+}: {
+  supabaseUrl: string;
+  serviceRole: string;
+  kieApiKey: string;
+  avatarId: string;
+  imageUrl: string;
+  displayName: string;
+}) {
+  const supabase = createClient(supabaseUrl, serviceRole);
+
+  try {
+    const result = await generateAvatarViaKIE({
+      kieApiKey,
+      baseImageUrl: imageUrl,
+      displayName,
+      avatarId,
+      supabase,
+    });
+
+    await supabase
+      .from("avatars")
+      .update({
+        source_image_url: result.imageUrl,
+        thumbnail_url: result.imageUrl,
+        kling_task_id: result.kieTaskId,
+        status: "completed",
+        error_message: result.warning,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", avatarId);
+
+    console.log(`Avatar ${avatarId} completed via ${result.provider}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error(`Avatar ${avatarId} generation failed:`, message);
+    await supabase
+      .from("avatars")
+      .update({
+        status: "failed",
+        error_message: message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", avatarId);
+  }
+}
+
+async function generateAvatarViaKIE({
+  kieApiKey,
   baseImageUrl,
   displayName,
   avatarId,
   supabase,
 }: {
+  kieApiKey: string;
   baseImageUrl: string;
   displayName: string;
   avatarId: string;
   supabase: ReturnType<typeof createClient>;
 }): Promise<GenerationResult> {
-  let klingError: string | null = null;
-
+  // Strategy 1: Use Flux Kontext image-to-image for high-fidelity 3D avatar
+  let fluxError: string | null = null;
   try {
-    const klingResult = await tryKlingGeneration(baseImageUrl, displayName);
-    if (klingResult?.imageUrl) {
+    const fluxResult = await tryFluxKontextAvatar(kieApiKey, baseImageUrl, displayName);
+    if (fluxResult?.imageUrl) {
+      // Persist the generated image to our storage
+      const persistedUrl = await persistImageFromUrl({
+        supabase,
+        avatarId,
+        sourceUrl: fluxResult.imageUrl,
+      });
       return {
-        imageUrl: klingResult.imageUrl,
-        provider: "kling",
-        klingTaskId: klingResult.taskId,
+        imageUrl: persistedUrl,
+        provider: "kie-flux-kontext",
+        kieTaskId: fluxResult.taskId,
         warning: null,
       };
     }
   } catch (error) {
-    klingError = error instanceof Error ? error.message : "Kling generation failed";
-    console.error("kling generation failed:", klingError);
+    fluxError = error instanceof Error ? error.message : "Flux Kontext generation failed";
+    console.error("flux kontext avatar failed:", fluxError);
   }
 
-  try {
-    const lovableImage = await generateAvatarWithLovableAI(baseImageUrl, displayName);
-    const uploadedUrl = await persistGeneratedImage({
-      supabase,
-      avatarId,
-      imageDataUrlOrUrl: lovableImage,
-    });
-
-    return {
-      imageUrl: uploadedUrl,
-      provider: "lovable-ai",
-      klingTaskId: null,
-      warning: klingError,
-    };
-  } catch (error) {
-    const fallbackError = error instanceof Error ? error.message : "Lovable AI avatar fallback failed";
-    console.error("lovable ai fallback failed:", fallbackError);
-
-    return {
-      imageUrl: baseImageUrl,
-      provider: "source",
-      klingTaskId: null,
-      warning: [klingError, fallbackError].filter(Boolean).join(" | ") || "Avatar generation fallback used",
-    };
-  }
+  // Fallback: return original image with warning
+  return {
+    imageUrl: baseImageUrl,
+    provider: "source",
+    kieTaskId: null,
+    warning: fluxError || "Avatar generation failed, using original image",
+  };
 }
 
-async function tryKlingGeneration(baseImageUrl: string, displayName: string): Promise<{ imageUrl: string | null; taskId: string | null } | null> {
-  const accessKey = Deno.env.get("KLING_ACCESS_KEY");
-  const secretKey = Deno.env.get("KLING_SECRET_KEY");
+// ========== Flux Kontext (Image-to-Image via KIE) ==========
 
-  if (!accessKey || !secretKey) {
-    throw new Error("KLING_ACCESS_KEY or KLING_SECRET_KEY missing");
-  }
+async function tryFluxKontextAvatar(
+  apiKey: string,
+  imageUrl: string,
+  displayName: string
+): Promise<{ imageUrl: string; taskId: string } | null> {
+  const prompt = `Transform this person's photo into a high-quality realistic 3D avatar portrait of ${displayName}. Preserve the exact facial identity, skin tone, eye shape, nose, lips, jawline, hairstyle, and face geometry. Render in clean 3D style with soft studio lighting, subtle depth and dimensionality. Head and shoulders framing, centered, clean neutral background. No text, no logos, no artifacts.`;
 
-  const token = await createKlingJWT(accessKey, secretKey);
+  console.log("Creating Flux Kontext avatar task via KIE...");
 
-  const createRes = await fetch(KLING_GENERATIONS_URL, {
+  const createRes = await fetch(KIE_FLUX_KONTEXT, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model_name: "kling-v1",
-      prompt:
-        `Create a high-fidelity 3D avatar portrait of ${displayName}. Keep the exact face identity, skin tone, hairstyle, and proportions from the input image. Neutral expression, cinematic soft studio lighting, clean background, centered head-and-shoulders framing.`,
-      image: baseImageUrl,
-      n: 1,
-      aspect_ratio: "1:1",
+      prompt,
+      inputImage: imageUrl,
+      aspectRatio: "1:1",
+      outputFormat: "png",
+      model: "flux-kontext-max",
+      promptUpsampling: false,
+      safetyTolerance: 6,
     }),
   });
 
   if (!createRes.ok) {
     const errorText = await createRes.text();
-    throw new Error(`Kling create failed (${createRes.status}): ${errorText}`);
+    throw new Error(`KIE Flux Kontext create failed (${createRes.status}): ${errorText}`);
   }
 
   const createData = await createRes.json();
-  const taskId =
-    createData?.data?.task_id ??
-    createData?.data?.id ??
-    createData?.task_id ??
-    createData?.id ??
-    null;
+  console.log("KIE Flux Kontext create response:", JSON.stringify(createData));
 
-  if (!taskId) {
-    const directOutput = extractKlingImageUrl(createData);
-    return { imageUrl: directOutput, taskId: null };
+  if (createData.code !== 200) {
+    throw new Error(`KIE Flux Kontext error (code ${createData.code}): ${createData.msg || "Unknown"}`);
   }
 
-  const imageUrl = await pollKlingTask(token, taskId, 20, 2500);
-  return { imageUrl, taskId };
+  const taskId = createData.data?.taskId;
+  if (!taskId) {
+    throw new Error("KIE Flux Kontext returned no taskId");
+  }
+
+  console.log(`Flux Kontext task created: ${taskId}, polling...`);
+
+  // Poll for completion
+  const imageResultUrl = await pollKieFluxTask(apiKey, taskId, 40, 3000);
+  if (!imageResultUrl) {
+    throw new Error("Flux Kontext task completed but returned no image URL");
+  }
+
+  return { imageUrl: imageResultUrl, taskId };
 }
 
-async function pollKlingTask(token: string, taskId: string, maxAttempts: number, intervalMs: number): Promise<string | null> {
+async function pollKieFluxTask(
+  apiKey: string,
+  taskId: string,
+  maxAttempts: number,
+  intervalMs: number
+): Promise<string | null> {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await delay(intervalMs);
 
-    const statusRes = await fetch(`${KLING_GENERATIONS_URL}/${taskId}`, {
+    // Use the Flux Kontext record-info endpoint
+    const statusRes = await fetch(`${KIE_FLUX_STATUS}?taskId=${taskId}`, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${apiKey}`,
       },
     });
 
     if (!statusRes.ok) {
+      if (statusRes.status >= 500) continue;
       const t = await statusRes.text();
-      if (statusRes.status >= 500) {
-        continue;
-      }
-      throw new Error(`Kling status failed (${statusRes.status}): ${t}`);
+      throw new Error(`KIE Flux status check failed (${statusRes.status}): ${t}`);
     }
 
     const statusData = await statusRes.json();
-    const statusRaw =
-      statusData?.data?.task_status ??
-      statusData?.data?.status ??
-      statusData?.task_status ??
-      statusData?.status ??
-      "";
+    console.log(`KIE flux poll attempt ${attempt + 1}:`, JSON.stringify(statusData));
 
-    const status = String(statusRaw).toLowerCase();
-
-    if (["succeed", "succeeded", "success", "completed", "done"].includes(status)) {
-      return extractKlingImageUrl(statusData);
+    if (statusData.code !== 200) {
+      // May be a transient error, keep polling
+      continue;
     }
 
-    if (["failed", "error", "canceled", "cancelled"].includes(status)) {
-      const reason = statusData?.data?.task_status_msg ?? statusData?.error ?? "Unknown Kling task failure";
-      throw new Error(`Kling task failed: ${reason}`);
+    const d = statusData.data;
+    if (!d) continue;
+
+    const flag = d.successFlag;
+
+    // 0 = generating, keep polling
+    if (flag === 0) continue;
+
+    // 1 = success
+    if (flag === 1) {
+      const resultUrl = d.response?.resultImageUrl;
+      if (typeof resultUrl === "string" && resultUrl.startsWith("http")) {
+        return resultUrl;
+      }
+      // Also check originImageUrl as fallback
+      const originUrl = d.response?.originImageUrl;
+      if (typeof originUrl === "string" && originUrl.startsWith("http")) {
+        return originUrl;
+      }
+      return null;
     }
-  }
 
-  return null;
-}
-
-function extractKlingImageUrl(payload: any): string | null {
-  const candidates: unknown[] = [
-    payload?.data?.task_result?.images?.[0]?.url,
-    payload?.data?.task_result?.images?.[0],
-    payload?.data?.images?.[0]?.url,
-    payload?.data?.images?.[0],
-    payload?.images?.[0]?.url,
-    payload?.images?.[0],
-    payload?.data?.result?.url,
-    payload?.data?.output?.url,
-    payload?.output?.[0],
-  ];
-
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.startsWith("http")) {
-      return candidate;
+    // 2 = create task failed, 3 = generate failed
+    if (flag === 2 || flag === 3) {
+      const errMsg = d.errorMessage || d.response?.errorMessage || "KIE generation failed";
+      throw new Error(`KIE Flux Kontext failed (flag=${flag}): ${errMsg}`);
     }
   }
 
-  return null;
+  throw new Error("KIE avatar task timed out after polling");
 }
 
-async function generateAvatarWithLovableAI(baseImageUrl: string, displayName: string): Promise<string> {
-  const lovableApiKey = Deno.env.get("LOVABLE_API_KEY");
-  if (!lovableApiKey) {
-    throw new Error("LOVABLE_API_KEY is not configured");
+function extractKieResult(data: any): string | null | undefined {
+  // Check for failure
+  const state = data?.data?.state ?? data?.state ?? "";
+  
+  if (state === "fail" || state === "failed") {
+    const failMsg = data?.data?.failMsg ?? data?.failMsg ?? "Unknown KIE task failure";
+    throw new Error(`KIE task failed: ${failMsg}`);
   }
 
-  const aiRes = await fetch(LOVABLE_AI_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${lovableApiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-pro-image-preview",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                `Transform this person into a realistic 3D avatar while preserving exact identity and facial features for ${displayName}. Keep skin tone, eye shape, nose, lips, hairstyle, and face geometry recognizable. Front-facing, shoulders visible, plain background, no text or logos.`,
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: baseImageUrl,
-              },
-            },
-          ],
-        },
-      ],
-      modalities: ["image", "text"],
-    }),
-  });
+  if (state === "success" || state === "completed") {
+    // resultJson is a JSON string: {"resultUrls":["https://..."]}
+    const resultJsonStr = data?.data?.resultJson ?? data?.resultJson;
+    if (typeof resultJsonStr === "string") {
+      try {
+        const parsed = JSON.parse(resultJsonStr);
+        const urls = parsed?.resultUrls ?? parsed?.result_urls ?? [];
+        if (Array.isArray(urls) && urls.length > 0 && typeof urls[0] === "string") {
+          return urls[0];
+        }
+      } catch {
+        console.error("Failed to parse KIE resultJson:", resultJsonStr);
+      }
+    }
 
-  if (!aiRes.ok) {
-    const errorText = await aiRes.text();
-    throw new Error(`Lovable AI request failed (${aiRes.status}): ${errorText}`);
+    // Also check direct URL fields
+    const directUrl = data?.data?.url ?? data?.data?.imageUrl ?? data?.data?.image_url;
+    if (typeof directUrl === "string" && directUrl.startsWith("http")) {
+      return directUrl;
+    }
+
+    // Check for images array
+    const images = data?.data?.images ?? data?.images;
+    if (Array.isArray(images) && images.length > 0) {
+      const first = images[0];
+      if (typeof first === "string" && first.startsWith("http")) return first;
+      if (typeof first?.url === "string") return first.url;
+    }
+
+    return null; // success but no URL found
   }
 
-  const aiData = await aiRes.json();
-  const imageUrl = aiData?.choices?.[0]?.message?.images?.[0]?.image_url?.url as string | undefined;
-
-  if (!imageUrl) {
-    throw new Error("Lovable AI returned no image");
-  }
-
-  return imageUrl;
+  // Still processing
+  return undefined;
 }
 
-async function persistGeneratedImage({
+// ========== Image Persistence ==========
+
+async function persistImageFromUrl({
   supabase,
   avatarId,
-  imageDataUrlOrUrl,
+  sourceUrl,
 }: {
   supabase: ReturnType<typeof createClient>;
   avatarId: string;
-  imageDataUrlOrUrl: string;
+  sourceUrl: string;
 }): Promise<string> {
-  if (imageDataUrlOrUrl.startsWith("http")) {
-    return imageDataUrlOrUrl;
+  try {
+    const imageRes = await fetch(sourceUrl);
+    if (!imageRes.ok) {
+      console.error("Failed to download generated avatar image, using source URL directly");
+      return sourceUrl;
+    }
+
+    const contentType = imageRes.headers.get("content-type") || "image/png";
+    const ext = contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" : "png";
+    const imageBytes = new Uint8Array(await imageRes.arrayBuffer());
+    const path = `generated/${avatarId}_${Date.now()}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from("avatars")
+      .upload(path, imageBytes, {
+        contentType,
+        upsert: true,
+      });
+
+    if (uploadErr) {
+      console.error("Failed to persist avatar to storage:", uploadErr.message);
+      return sourceUrl;
+    }
+
+    const { data } = supabase.storage.from("avatars").getPublicUrl(path);
+    return data.publicUrl;
+  } catch (err) {
+    console.error("persistImageFromUrl error:", err);
+    return sourceUrl;
   }
-
-  if (!imageDataUrlOrUrl.startsWith("data:image/")) {
-    throw new Error("Unsupported image format from AI provider");
-  }
-
-  const { bytes, contentType, ext } = decodeDataUrl(imageDataUrlOrUrl);
-  const path = `generated/${avatarId}_${Date.now()}.${ext}`;
-
-  const { error: uploadErr } = await supabase.storage
-    .from("avatars")
-    .upload(path, bytes, {
-      contentType,
-      upsert: true,
-    });
-
-  if (uploadErr) {
-    throw new Error(`Failed to store generated avatar: ${uploadErr.message}`);
-  }
-
-  const { data } = supabase.storage.from("avatars").getPublicUrl(path);
-  return data.publicUrl;
-}
-
-function decodeDataUrl(dataUrl: string): { bytes: Uint8Array; contentType: string; ext: string } {
-  const [meta, b64] = dataUrl.split(",");
-  if (!meta || !b64) {
-    throw new Error("Invalid data URL");
-  }
-
-  const contentType = meta.match(/data:([^;]+)/)?.[1] || "image/png";
-  const ext = contentType.split("/")[1] || "png";
-
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  return { bytes, contentType, ext };
-}
-
-async function createKlingJWT(accessKey: string, secretKey: string): Promise<string> {
-  const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const now = Math.floor(Date.now() / 1000);
-  const payload = btoa(JSON.stringify({ iss: accessKey, exp: now + 1800, nbf: now - 5, iat: now }));
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", encoder.encode(secretKey),
-    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(`${header}.${payload}`));
-  const b64sig = btoa(String.fromCharCode(...new Uint8Array(sig)))
-    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return `${header}.${payload}.${b64sig}`;
 }
 
 function delay(ms: number) {

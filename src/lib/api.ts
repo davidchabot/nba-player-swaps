@@ -54,10 +54,7 @@ export async function createAvatar(
   name: string
 ): Promise<{
   avatar_id: string;
-  avatar_image_url?: string;
-  provider?: "kling" | "lovable-ai" | "source";
-  warning?: string | null;
-  kling_task_id?: string | null;
+  status: string;
 }> {
   return invokeFunction("create-avatar", {
     image_url: imageUrl,
