@@ -157,20 +157,21 @@ async function runReplacementJob({
   try {
     await updateJob(supabase, jobId, "pose_extraction", 20);
 
-    const clickCoord = await findTrackClickCoordinate(supabase, videoId, trackId);
+    const promptBundle = await findTrackPromptBundle(supabase, videoId, trackId);
 
     await updateJob(supabase, jobId, "segmentation", 35);
 
     const segmentation = await runFlowRVSMasking({
       replicateToken,
       videoUrl,
-      clickCoordinate: clickCoord,
+      promptBundle,
+      onPredictionCreated: async (predictionId) => {
+        await supabase
+          .from("replacement_jobs")
+          .update({ flowrvs_task_id: predictionId, updated_at: new Date().toISOString() })
+          .eq("id", jobId);
+      },
     });
-
-    await supabase
-      .from("replacement_jobs")
-      .update({ flowrvs_task_id: segmentation.predictionId })
-      .eq("id", jobId);
 
     await updateJob(supabase, jobId, "rendering", 60);
     await delay(700);
