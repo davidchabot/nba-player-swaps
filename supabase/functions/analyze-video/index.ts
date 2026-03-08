@@ -182,7 +182,7 @@ async function runFlowRVSSegmentation({
   replicateToken: string;
   videoUrl: string;
 }): Promise<{ predictionId: string; maskUrls: string[]; method: string; modelUsed: string; seedPoints: SeedPoint[] }> {
-  const modelFromEnv = Deno.env.get("FLOWRVS_REPLICATE_MODEL")?.trim();
+  
 
   const seedPoints = DEFAULT_SEED_POINTS;
   const clickCoordinates = seedPoints

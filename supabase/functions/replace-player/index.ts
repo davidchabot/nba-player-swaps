@@ -165,7 +165,7 @@ async function runFlowRVSMasking({
   videoUrl: string;
   clickCoordinate: string;
 }): Promise<{ predictionId: string; outputUrl: string | null; method: string; modelUsed: string }> {
-  const modelFromEnv = Deno.env.get("FLOWRVS_REPLICATE_MODEL")?.trim();
+  
 
   const input = {
     input_video: videoUrl,
