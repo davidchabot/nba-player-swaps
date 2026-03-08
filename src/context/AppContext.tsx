@@ -108,8 +108,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function useApp() {
-  const context = useContext(AppContext);
-  if (!context) throw new Error("useApp must be used within AppProvider");
-  return context;
+// Hook to access app state
+export function useApp(): AppState {
+  const ctx = useContext(AppContext);
+  if (ctx === undefined) {
+    throw new Error("useApp must be used within AppProvider");
+  }
+  return ctx;
 }
