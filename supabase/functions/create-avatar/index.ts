@@ -181,36 +181,36 @@ async function generateAvatarViaKIE({
   avatarId: string;
   supabase: ReturnType<typeof createClient>;
 }): Promise<GenerationResult> {
-  // Strategy 1: Use Flux Kontext image-to-image for high-fidelity 3D avatar
-  let fluxError: string | null = null;
-  try {
-    const fluxResult = await tryFluxKontextAvatar(kieApiKey, baseImageUrl, displayName);
-    if (fluxResult?.imageUrl) {
-      // Persist the generated image to our storage
+  let lastError: string | null = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const fluxResult = await tryFluxKontextAvatar(kieApiKey, baseImageUrl, displayName);
+      if (!fluxResult?.imageUrl) {
+        throw new Error("Flux Kontext completed but returned no image URL");
+      }
+
       const persistedUrl = await persistImageFromUrl({
         supabase,
         avatarId,
         sourceUrl: fluxResult.imageUrl,
       });
+
       return {
         imageUrl: persistedUrl,
         provider: "kie-flux-kontext",
         kieTaskId: fluxResult.taskId,
-        warning: null,
       };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : "Flux Kontext generation failed";
+      console.error(`flux kontext avatar failed (attempt ${attempt}/2):`, lastError);
+      if (attempt < 2) {
+        await delay(2000 * attempt);
+      }
     }
-  } catch (error) {
-    fluxError = error instanceof Error ? error.message : "Flux Kontext generation failed";
-    console.error("flux kontext avatar failed:", fluxError);
   }
 
-  // Fallback: return original image with warning
-  return {
-    imageUrl: baseImageUrl,
-    provider: "source",
-    kieTaskId: null,
-    warning: fluxError || "Avatar generation failed, using original image",
-  };
+  throw new Error(lastError || "Avatar generation failed after retries");
 }
 
 // ========== Flux Kontext (Image-to-Image via KIE) ==========
