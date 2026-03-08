@@ -1,11 +1,27 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { useApp } from "@/context/AppContext";
+import LandingPage from "@/components/LandingPage";
+import AvatarCreation from "@/components/AvatarCreation";
+import VideoUpload from "@/components/VideoUpload";
+import AnalysisProgress from "@/components/AnalysisProgress";
+import PlayerSelection from "@/components/PlayerSelection";
+import ReplacementProgress from "@/components/ReplacementProgress";
+import ResultPage from "@/components/ResultPage";
+import TopNav from "@/components/TopNav";
 
 const Index = () => {
+  const { currentStep } = useApp();
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <div className="text-center">
-        <h1 className="mb-4 text-4xl font-bold">Welcome to Your Blank App</h1>
-        <p className="text-xl text-muted-foreground">Start building your amazing project here!</p>
+    <div className="min-h-screen bg-background">
+      <TopNav />
+      <div className={currentStep !== "landing" ? "pt-16" : ""}>
+        {currentStep === "landing" && <LandingPage />}
+        {currentStep === "avatar" && <AvatarCreation />}
+        {currentStep === "upload" && <VideoUpload />}
+        {currentStep === "analyzing" && <AnalysisProgress />}
+        {currentStep === "select-player" && <PlayerSelection />}
+        {currentStep === "replacing" && <ReplacementProgress />}
+        {currentStep === "result" && <ResultPage />}
       </div>
     </div>
   );
