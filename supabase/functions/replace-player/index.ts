@@ -177,7 +177,7 @@ async function runFlowRVSMasking({
     video_fps: 12,
   };
 
-  const prediction = await createPredictionWithFallback(replicateToken, input, modelFromEnv);
+  const prediction = await createPredictionWithFallback(replicateToken, input);
   const output = await pollReplicateStrict(replicateToken, prediction.id, 22, 2500);
   const outputUrl = extractOutputUrl(output);
 
