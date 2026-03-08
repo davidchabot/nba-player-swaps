@@ -14,6 +14,8 @@ const FLOWRVS_PROMPTS = [
   "the man who is defending",
   "basketball",
 ];
+const REPLICATE_POLL_INTERVAL_MS = 3000;
+const REPLICATE_POLL_TIMEOUT_MS = 12 * 60 * 1000;
 
 type SeedPoint = { x: number; y: number };
 
@@ -259,7 +261,12 @@ async function runFlowRVSSegmentation({
   };
 
   const prediction = await createPredictionExactVersion(replicateToken, input);
-  const output = await pollReplicateStrict(replicateToken, prediction.id, 45, 2500);
+  const output = await pollReplicateStrict(
+    replicateToken,
+    prediction.id,
+    REPLICATE_POLL_TIMEOUT_MS,
+    REPLICATE_POLL_INTERVAL_MS
+  );
   const maskUrls = extractMaskUrls(output);
 
   return {
@@ -335,10 +342,15 @@ function parseRetryAfterSeconds(payload: string, attempt: number): number {
 async function pollReplicateStrict(
   token: string,
   predictionId: string,
-  maxAttempts: number,
+  timeoutMs: number,
   intervalMs: number
 ): Promise<unknown> {
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  const startedAt = Date.now();
+  let lastStatus = "starting";
+  let lastError: string | null = null;
+  let rateLimitRetryCount = 0;
+
+  while (Date.now() - startedAt < timeoutMs) {
     await delay(intervalMs);
 
     const response = await fetch(`${REPLICATE_API}/${predictionId}`, {
@@ -350,7 +362,8 @@ async function pollReplicateStrict(
     if (!response.ok) {
       const text = await response.text();
       if (response.status === 429) {
-        const waitSeconds = parseRetryAfterSeconds(text, attempt);
+        const waitSeconds = parseRetryAfterSeconds(text, rateLimitRetryCount);
+        rateLimitRetryCount += 1;
         await delay(waitSeconds * 1000);
         continue;
       }
@@ -361,17 +374,26 @@ async function pollReplicateStrict(
     }
 
     const data = await response.json();
+    lastStatus = typeof data.status === "string" ? data.status : "unknown";
 
-    if (data.status === "succeeded") {
+    if (typeof data.error === "string" && data.error.trim().length > 0) {
+      lastError = data.error;
+    }
+
+    if (lastStatus === "succeeded") {
       return data.output;
     }
 
-    if (data.status === "failed" || data.status === "canceled") {
-      throw new Error(`Masking prediction failed: ${data.error || "Unknown error"}`);
+    if (lastStatus === "failed" || lastStatus === "canceled") {
+      throw new Error(`Masking prediction failed: ${lastError || "Unknown error"}`);
     }
   }
 
-  throw new Error("Masking prediction timed out");
+  const timeoutMinutes = Math.round((timeoutMs / 60000) * 10) / 10;
+  const errorSuffix = lastError ? ` Last error: ${lastError}` : "";
+  throw new Error(
+    `Masking prediction timed out after ${timeoutMinutes} minutes (last status: ${lastStatus}).${errorSuffix}`
+  );
 }
 
 function extractMaskUrls(output: unknown): string[] {
