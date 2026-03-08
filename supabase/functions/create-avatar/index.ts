@@ -229,40 +229,54 @@ async function pollKieFluxTask(
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await delay(intervalMs);
 
-    // Try the Flux-specific status endpoint first, fall back to market endpoint
-    const statusRes = await fetch(`${KIE_FLUX_STATUS}/${taskId}`, {
+    // Use the Flux Kontext record-info endpoint
+    const statusRes = await fetch(`${KIE_FLUX_STATUS}?taskId=${taskId}`, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
       },
     });
 
     if (!statusRes.ok) {
-      // Try the generic market endpoint
-      const marketRes = await fetch(`${KIE_TASK_STATUS}?taskId=${taskId}`, {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-      });
-
-      if (!marketRes.ok) {
-        if (marketRes.status >= 500) continue;
-        const t = await marketRes.text();
-        throw new Error(`KIE status check failed (${marketRes.status}): ${t}`);
-      }
-
-      const marketData = await marketRes.json();
-      console.log(`KIE market poll attempt ${attempt + 1}:`, JSON.stringify(marketData));
-      
-      const result = extractKieResult(marketData);
-      if (result !== undefined) return result;
-      continue;
+      if (statusRes.status >= 500) continue;
+      const t = await statusRes.text();
+      throw new Error(`KIE Flux status check failed (${statusRes.status}): ${t}`);
     }
 
     const statusData = await statusRes.json();
     console.log(`KIE flux poll attempt ${attempt + 1}:`, JSON.stringify(statusData));
 
-    const result = extractKieResult(statusData);
-    if (result !== undefined) return result;
+    if (statusData.code !== 200) {
+      // May be a transient error, keep polling
+      continue;
+    }
+
+    const d = statusData.data;
+    if (!d) continue;
+
+    const flag = d.successFlag;
+
+    // 0 = generating, keep polling
+    if (flag === 0) continue;
+
+    // 1 = success
+    if (flag === 1) {
+      const resultUrl = d.response?.resultImageUrl;
+      if (typeof resultUrl === "string" && resultUrl.startsWith("http")) {
+        return resultUrl;
+      }
+      // Also check originImageUrl as fallback
+      const originUrl = d.response?.originImageUrl;
+      if (typeof originUrl === "string" && originUrl.startsWith("http")) {
+        return originUrl;
+      }
+      return null;
+    }
+
+    // 2 = create task failed, 3 = generate failed
+    if (flag === 2 || flag === 3) {
+      const errMsg = d.errorMessage || d.response?.errorMessage || "KIE generation failed";
+      throw new Error(`KIE Flux Kontext failed (flag=${flag}): ${errMsg}`);
+    }
   }
 
   throw new Error("KIE avatar task timed out after polling");
