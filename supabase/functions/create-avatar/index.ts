@@ -37,10 +37,9 @@ serve(async (req) => {
     const kieApiKey = Deno.env.get("KIE_API_KEY");
     if (!kieApiKey) throw new Error("KIE_API_KEY is not configured. Please add your KIE API key.");
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, serviceRole);
 
     const { data: avatar, error: insertErr } = await supabase
       .from("avatars")
@@ -56,37 +55,23 @@ serve(async (req) => {
     if (insertErr) throw insertErr;
     avatarId = avatar.id;
 
-    const result = await generateAvatarViaKIE({
-      kieApiKey,
-      baseImageUrl: image_url,
-      displayName: name || "My Avatar",
-      avatarId,
-      supabase,
-    });
-
-    const { error: updateErr } = await supabase
-      .from("avatars")
-      .update({
-        source_image_url: result.imageUrl,
-        thumbnail_url: result.imageUrl,
-        kling_task_id: result.kieTaskId,
-        status: "completed",
-        error_message: result.warning,
-        updated_at: new Date().toISOString(),
+    // Run generation in background to avoid HTTP timeout
+    queueBackgroundTask(
+      runAvatarGeneration({
+        supabaseUrl,
+        serviceRole,
+        kieApiKey,
+        avatarId,
+        imageUrl: image_url,
+        displayName: name || "My Avatar",
       })
-      .eq("id", avatarId);
-
-    if (updateErr) throw updateErr;
+    );
 
     return new Response(
       JSON.stringify({
         success: true,
         avatar_id: avatarId,
-        avatar_image_url: result.imageUrl,
-        provider: result.provider,
-        warning: result.warning,
-        kling_task_id: result.kieTaskId,
-        status: "completed",
+        status: "processing",
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
@@ -118,6 +103,68 @@ serve(async (req) => {
     );
   }
 });
+
+function queueBackgroundTask(task: Promise<void>) {
+  const runtime = (globalThis as { EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void } }).EdgeRuntime;
+  if (runtime?.waitUntil) {
+    runtime.waitUntil(task);
+    return;
+  }
+  task.catch((error) => console.error("create-avatar background task error:", error));
+}
+
+async function runAvatarGeneration({
+  supabaseUrl,
+  serviceRole,
+  kieApiKey,
+  avatarId,
+  imageUrl,
+  displayName,
+}: {
+  supabaseUrl: string;
+  serviceRole: string;
+  kieApiKey: string;
+  avatarId: string;
+  imageUrl: string;
+  displayName: string;
+}) {
+  const supabase = createClient(supabaseUrl, serviceRole);
+
+  try {
+    const result = await generateAvatarViaKIE({
+      kieApiKey,
+      baseImageUrl: imageUrl,
+      displayName,
+      avatarId,
+      supabase,
+    });
+
+    await supabase
+      .from("avatars")
+      .update({
+        source_image_url: result.imageUrl,
+        thumbnail_url: result.imageUrl,
+        kling_task_id: result.kieTaskId,
+        status: "completed",
+        error_message: result.warning,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", avatarId);
+
+    console.log(`Avatar ${avatarId} completed via ${result.provider}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error(`Avatar ${avatarId} generation failed:`, message);
+    await supabase
+      .from("avatars")
+      .update({
+        status: "failed",
+        error_message: message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", avatarId);
+  }
+}
 
 async function generateAvatarViaKIE({
   kieApiKey,
