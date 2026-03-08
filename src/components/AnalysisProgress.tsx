@@ -28,6 +28,7 @@ export default function AnalysisProgress() {
   const { toast } = useToast();
   const [job, setJob] = useState<AnalysisJob | null>(null);
   const startedRef = useRef(false);
+  const completedRef = useRef(false);
 
   useEffect(() => {
     if (startedRef.current || !videoDbId || !videoPublicUrl) return;
@@ -36,64 +37,16 @@ export default function AnalysisProgress() {
     let unsubscribe: (() => void) | null = null;
     let pollInterval: ReturnType<typeof setInterval> | null = null;
 
-    async function start() {
-      try {
-        // Start the analysis
-        const result = await analyzeVideo(videoDbId!, videoPublicUrl!);
-        const jobId = result.job_id;
-        setAnalysisJobId(jobId);
-
-        // Subscribe to realtime updates
-        unsubscribe = subscribeToAnalysisJob(jobId, (updatedJob) => {
-          const analysisJob: AnalysisJob = {
-            id: updatedJob.id,
-            videoClipId: updatedJob.video_id,
-            status: updatedJob.status,
-            progress: updatedJob.progress,
-          };
-          setJob(analysisJob);
-
-          if (updatedJob.status === "completed") {
-            handleCompleted(jobId);
-          } else if (updatedJob.status === "failed") {
-            toast({ title: "Analysis Failed", description: updatedJob.error_message || "Unknown error", variant: "destructive" });
-          }
-        });
-
-        // Also poll as fallback since the edge function runs synchronously
-        pollInterval = setInterval(async () => {
-          try {
-            const statusData = await getAnalysisStatus(jobId);
-            if (statusData.job) {
-              const j = statusData.job;
-              setJob({
-                id: j.id,
-                videoClipId: j.video_id,
-                status: j.status,
-                progress: j.progress,
-              });
-              if (j.status === "completed") {
-                handleCompleted(jobId);
-              }
-            }
-          } catch { /* ignore poll errors */ }
-        }, 3000);
-
-      } catch (err) {
-        console.error("Analysis start error:", err);
-        toast({
-          title: "Analysis Failed",
-          description: err instanceof Error ? err.message : "Failed to start video analysis",
-          variant: "destructive",
-        });
-      }
-    }
-
     async function handleCompleted(jobId: string) {
+      if (completedRef.current) return;
+      completedRef.current = true;
+
       if (pollInterval) clearInterval(pollInterval);
+
       try {
         const statusData = await getAnalysisStatus(jobId);
         const dbTracks = statusData.tracks || [];
+
         const playerTracks: PlayerTrack[] = dbTracks.map((t: any) => ({
           trackId: t.track_id,
           qualityScore: Number(t.quality_score),
@@ -105,14 +58,90 @@ export default function AnalysisProgress() {
           frameRange: [t.frame_start, t.frame_end] as [number, number],
           boundingBoxes: t.bounding_boxes || [],
         }));
+
         setTracks(playerTracks);
-        setTimeout(() => setCurrentStep("select-player"), 1200);
-      } catch (err) {
-        console.error("Error fetching tracks:", err);
+        setTimeout(() => setCurrentStep("select-player"), 1000);
+      } catch (error) {
+        console.error("Error fetching tracks:", error);
+        toast({
+          title: "Analysis Incomplete",
+          description: "Could not load detected tracks. Please re-upload the video.",
+          variant: "destructive",
+        });
+        setCurrentStep("upload");
       }
     }
 
-    start();
+    async function handleFailed(message?: string) {
+      if (pollInterval) clearInterval(pollInterval);
+      toast({
+        title: "Analysis Failed",
+        description: message || "Video analysis failed. Please try another clip.",
+        variant: "destructive",
+      });
+      setCurrentStep("upload");
+    }
+
+    async function start() {
+      try {
+        const result = await analyzeVideo(videoDbId, videoPublicUrl);
+        const jobId = result.job_id;
+        setAnalysisJobId(jobId);
+
+        unsubscribe = subscribeToAnalysisJob(jobId, (updatedJob) => {
+          const analysisJob: AnalysisJob = {
+            id: updatedJob.id,
+            videoClipId: updatedJob.video_id,
+            status: updatedJob.status,
+            progress: updatedJob.progress,
+          };
+
+          setJob(analysisJob);
+
+          if (updatedJob.status === "completed") {
+            void handleCompleted(jobId);
+            return;
+          }
+
+          if (updatedJob.status === "failed") {
+            void handleFailed(updatedJob.error_message);
+          }
+        });
+
+        pollInterval = setInterval(async () => {
+          try {
+            const statusData = await getAnalysisStatus(jobId);
+            const j = statusData.job;
+            if (!j) return;
+
+            setJob({
+              id: j.id,
+              videoClipId: j.video_id,
+              status: j.status,
+              progress: j.progress,
+            });
+
+            if (j.status === "completed") {
+              void handleCompleted(jobId);
+            } else if (j.status === "failed") {
+              void handleFailed(j.error_message);
+            }
+          } catch {
+            // Poll fallback should be resilient; ignore transient errors.
+          }
+        }, 2500);
+      } catch (error) {
+        console.error("Analysis start error:", error);
+        toast({
+          title: "Analysis Failed",
+          description: error instanceof Error ? error.message : "Failed to start video analysis",
+          variant: "destructive",
+        });
+        setCurrentStep("upload");
+      }
+    }
+
+    void start();
 
     return () => {
       if (unsubscribe) unsubscribe();
