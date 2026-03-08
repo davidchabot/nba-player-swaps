@@ -85,14 +85,99 @@ serve(async (req) => {
 
     jobId = job.id;
 
-    await supabase.from("videos").update({ status: "processing" }).eq("id", video_id);
+    await supabase
+      .from("videos")
+      .update({ status: "processing", updated_at: new Date().toISOString() })
+      .eq("id", video_id);
 
+    queueBackgroundTask(
+      runAnalysisJob({
+        supabaseUrl,
+        serviceRole,
+        replicateToken,
+        jobId,
+        videoId: video_id,
+        videoUrl: video_url,
+      })
+    );
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        job_id: jobId,
+        status: "queued",
+        model_used: `meta/sam-2-video:${FLOWRVS_SAM2_VERSION}`,
+        flowrvs_prompts: FLOWRVS_PROMPTS,
+        fps: 12,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+  } catch (error) {
+    console.error("analyze-video error:", error);
+
+    try {
+      const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+      const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+      const supabase = createClient(supabaseUrl, serviceRole);
+
+      if (jobId) {
+        await failJob(supabase, jobId, error instanceof Error ? error.message : "Unknown error");
+      }
+
+      if (videoId) {
+        await supabase
+          .from("videos")
+          .update({ status: "failed", updated_at: new Date().toISOString() })
+          .eq("id", videoId);
+      }
+    } catch (innerError) {
+      console.error("failed to mark analyze state as failed:", innerError);
+    }
+
+    return new Response(
+      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+});
+
+function queueBackgroundTask(task: Promise<void>) {
+  const runtime = (globalThis as { EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void } }).EdgeRuntime;
+
+  if (runtime?.waitUntil) {
+    runtime.waitUntil(task);
+    return;
+  }
+
+  task.catch((error) => console.error("analyze-video background task error:", error));
+}
+
+async function runAnalysisJob({
+  supabaseUrl,
+  serviceRole,
+  replicateToken,
+  jobId,
+  videoId,
+  videoUrl,
+}: {
+  supabaseUrl: string;
+  serviceRole: string;
+  replicateToken: string;
+  jobId: string;
+  videoId: string;
+  videoUrl: string;
+}) {
+  const supabase = createClient(supabaseUrl, serviceRole);
+
+  try {
     await updateJob(supabase, jobId, "scene_detection", 20);
     await updateJob(supabase, jobId, "tracking", 35);
 
     const segmentation = await runFlowRVSSegmentation({
       replicateToken,
-      videoUrl: video_url,
+      videoUrl,
     });
 
     await supabase
@@ -130,50 +215,20 @@ serve(async (req) => {
       })
       .eq("id", jobId);
 
-    await supabase.from("videos").update({ status: "ready" }).eq("id", video_id);
-
-    return new Response(
-      JSON.stringify({
-        success: true,
-        job_id: jobId,
-        tracks_count: tracksCount,
-        detection_method: segmentation.method,
-        model_used: segmentation.modelUsed,
-        flowrvs_prompts: FLOWRVS_PROMPTS,
-        fps: 12,
-      }),
-      {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    await supabase
+      .from("videos")
+      .update({ status: "ready", updated_at: new Date().toISOString() })
+      .eq("id", videoId);
   } catch (error) {
-    console.error("analyze-video error:", error);
-
-    try {
-      const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-      const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-      const supabase = createClient(supabaseUrl, serviceRole);
-
-      if (jobId) {
-        await failJob(supabase, jobId, error instanceof Error ? error.message : "Unknown error");
-      }
-
-      if (videoId) {
-        await supabase
-          .from("videos")
-          .update({ status: "failed", updated_at: new Date().toISOString() })
-          .eq("id", videoId);
-      }
-    } catch (innerError) {
-      console.error("failed to mark analyze state as failed:", innerError);
-    }
-
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await failJob(supabase, jobId, message);
+    await supabase
+      .from("videos")
+      .update({ status: "failed", updated_at: new Date().toISOString() })
+      .eq("id", videoId);
+    console.error("analyze-video processing error:", error);
   }
-});
+}
 
 async function runFlowRVSSegmentation({
   replicateToken,
@@ -204,7 +259,7 @@ async function runFlowRVSSegmentation({
   };
 
   const prediction = await createPredictionExactVersion(replicateToken, input);
-  const output = await pollReplicateStrict(replicateToken, prediction.id, 120, 3000);
+  const output = await pollReplicateStrict(replicateToken, prediction.id, 45, 2500);
   const maskUrls = extractMaskUrls(output);
 
   return {
