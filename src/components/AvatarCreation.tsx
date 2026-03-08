@@ -260,7 +260,7 @@ export default function AvatarCreation() {
                   onChange={(e) => setAvatarName(e.target.value)}
                   className="w-full px-4 py-3 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
                 />
-                <p className="text-xs text-muted-foreground">We now run multi-provider generation with automatic fallback for fewer failures.</p>
+                <p className="text-xs text-muted-foreground">Generation can take 1–3 minutes depending on image quality and queue load.</p>
                 <div className="flex gap-3">
                   <Button variant="outline" onClick={reset} className="flex-1" disabled={isCreating}>
                     <RotateCcw className="w-4 h-4 mr-2" /> Retake
