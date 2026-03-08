@@ -348,6 +348,7 @@ async function pollReplicateStrict(
   const startedAt = Date.now();
   let lastStatus = "starting";
   let lastError: string | null = null;
+  let rateLimitRetryCount = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
     await delay(intervalMs);
@@ -361,7 +362,8 @@ async function pollReplicateStrict(
     if (!response.ok) {
       const text = await response.text();
       if (response.status === 429) {
-        const waitSeconds = parseRetryAfterSeconds(text, 0);
+        const waitSeconds = parseRetryAfterSeconds(text, rateLimitRetryCount);
+        rateLimitRetryCount += 1;
         await delay(waitSeconds * 1000);
         continue;
       }
