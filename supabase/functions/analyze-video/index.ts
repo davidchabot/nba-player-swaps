@@ -203,7 +203,7 @@ async function runFlowRVSSegmentation({
     video_fps: 12,
   };
 
-  const prediction = await createPredictionWithFallback(replicateToken, input, modelFromEnv);
+  const prediction = await createPredictionWithFallback(replicateToken, input);
   const output = await pollReplicateStrict(replicateToken, prediction.id, 20, 2500);
   const maskUrls = extractMaskUrls(output);
 
