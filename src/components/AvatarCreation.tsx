@@ -4,7 +4,7 @@ import { Camera, Upload, User, ArrowRight, RotateCcw, Check, Loader2 } from "luc
 import { Button } from "@/components/ui/button";
 import { useApp } from "@/context/AppContext";
 import { Avatar } from "@/types";
-import { uploadAvatarImage, createAvatar } from "@/lib/api";
+import { uploadAvatarImage, createAvatar, getAvatarStatus } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 
 type Mode = "choose" | "camera" | "upload" | "preview";
