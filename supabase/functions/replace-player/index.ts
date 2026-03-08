@@ -214,29 +214,54 @@ async function runReplacementJob({
   }
 }
 
+type TrackBoundingBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  frame?: number;
+};
+
+type PromptBundle = {
+  clickCoordinates: string;
+  clickLabels: string;
+  clickFrames: string;
+  clickObjectIds: string;
+};
+
 async function runFlowRVSMasking({
   replicateToken,
   videoUrl,
-  clickCoordinate,
+  promptBundle,
+  onPredictionCreated,
 }: {
   replicateToken: string;
   videoUrl: string;
-  clickCoordinate: string;
+  promptBundle: PromptBundle;
+  onPredictionCreated?: (predictionId: string) => Promise<void>;
 }): Promise<{ predictionId: string; outputUrl: string | null; method: string; modelUsed: string }> {
-  
-
   const input = {
     input_video: videoUrl,
-    click_coordinates: clickCoordinate,
-    click_labels: "1",
-    click_frames: "0",
-    click_object_ids: "1",
+    click_coordinates: promptBundle.clickCoordinates,
+    click_labels: promptBundle.clickLabels,
+    click_frames: promptBundle.clickFrames,
+    click_object_ids: promptBundle.clickObjectIds,
     output_video: true,
     video_fps: 12,
   };
 
   const prediction = await createPredictionExactVersion(replicateToken, input);
-  const output = await pollReplicateStrict(replicateToken, prediction.id, 45, 2500);
+
+  if (onPredictionCreated) {
+    await onPredictionCreated(prediction.id);
+  }
+
+  const output = await pollReplicateStrict(
+    replicateToken,
+    prediction.id,
+    REPLICATE_POLL_TIMEOUT_MS,
+    REPLICATE_POLL_INTERVAL_MS
+  );
   const outputUrl = extractOutputUrl(output);
 
   return {
@@ -247,11 +272,13 @@ async function runFlowRVSMasking({
   };
 }
 
-async function findTrackClickCoordinate(
+async function findTrackPromptBundle(
   supabase: ReturnType<typeof createClient>,
   videoId: string,
   trackId: string
-): Promise<string> {
+): Promise<PromptBundle> {
+  const fallbackCoordinate = "[320,300]";
+
   const { data: latestAnalysis } = await supabase
     .from("analysis_jobs")
     .select("id")
@@ -262,7 +289,12 @@ async function findTrackClickCoordinate(
     .maybeSingle();
 
   if (!latestAnalysis) {
-    return "[320,300]";
+    return {
+      clickCoordinates: fallbackCoordinate,
+      clickLabels: "1",
+      clickFrames: "0",
+      clickObjectIds: "1",
+    };
   }
 
   const { data: track } = await supabase
@@ -273,17 +305,52 @@ async function findTrackClickCoordinate(
     .limit(1)
     .maybeSingle();
 
-  const boxes = (track?.bounding_boxes as Array<Record<string, number>> | null) ?? [];
-  const first = boxes[0];
+  const rawBoxes = (track?.bounding_boxes as TrackBoundingBox[] | null) ?? [];
+  const normalizedBoxes = rawBoxes
+    .filter((box) => Number.isFinite(box?.x) && Number.isFinite(box?.y) && Number.isFinite(box?.width) && Number.isFinite(box?.height))
+    .sort((a, b) => (a.frame ?? 0) - (b.frame ?? 0));
 
-  if (!first) {
-    return "[320,300]";
+  if (normalizedBoxes.length === 0) {
+    return {
+      clickCoordinates: fallbackCoordinate,
+      clickLabels: "1",
+      clickFrames: "0",
+      clickObjectIds: "1",
+    };
   }
 
-  const centerX = Math.round((first.x + first.width / 2) * 640);
-  const centerY = Math.round((first.y + first.height / 2) * 360);
+  const stride = Math.max(1, Math.floor(normalizedBoxes.length / MAX_TRACK_PROMPT_POINTS));
+  const sampled = normalizedBoxes.filter((_, index) => index % stride === 0).slice(0, MAX_TRACK_PROMPT_POINTS);
 
-  return `[${Math.max(0, centerX)},${Math.max(0, centerY)}]`;
+  const coordinateParts: string[] = [];
+  const frameParts: string[] = [];
+
+  for (const box of sampled) {
+    const centerX = Math.round((box.x + box.width / 2) * 640);
+    const centerY = Math.round((box.y + box.height / 2) * 360);
+    coordinateParts.push(`[${Math.max(0, centerX)},${Math.max(0, centerY)}]`);
+    frameParts.push(String(Math.max(0, Math.round(box.frame ?? 0))));
+  }
+
+  if (coordinateParts.length === 0) {
+    coordinateParts.push(fallbackCoordinate);
+    frameParts.push("0");
+  }
+
+  if (frameParts[0] !== "0") {
+    coordinateParts.unshift(coordinateParts[0]);
+    frameParts.unshift("0");
+  }
+
+  const clickLabels = coordinateParts.map(() => "1").join(",");
+  const clickObjectIds = coordinateParts.map(() => "1").join(",");
+
+  return {
+    clickCoordinates: coordinateParts.join(","),
+    clickLabels,
+    clickFrames: frameParts.join(","),
+    clickObjectIds,
+  };
 }
 
 async function createPredictionExactVersion(
