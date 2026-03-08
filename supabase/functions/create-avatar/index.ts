@@ -12,7 +12,7 @@ const KIE_BASE = "https://api.kie.ai";
 const KIE_FLUX_KONTEXT = `${KIE_BASE}/api/v1/flux/kontext/generate`;
 const KIE_CREATE_TASK = `${KIE_BASE}/api/v1/jobs/createTask`;
 const KIE_TASK_STATUS = `${KIE_BASE}/api/v1/jobs/recordInfo`;
-const KIE_FLUX_STATUS = `${KIE_BASE}/api/v1/flux/kontext`;
+const KIE_FLUX_STATUS = `${KIE_BASE}/api/v1/flux/kontext/record-info`;
 
 type AvatarProvider = "kie-flux-kontext" | "kie-kling-avatar" | "source";
 
