@@ -218,26 +218,22 @@ async function runFlowRVSSegmentation({
 
 async function createPredictionWithFallback(
   token: string,
-  input: Record<string, unknown>,
-  envModel: string | null
+  input: Record<string, unknown>
 ): Promise<{ id: string; modelUsed: string }> {
-  const candidateBodies: Array<{ label: string; body: Record<string, unknown> }> = [];
-
-  if (envModel) {
-    candidateBodies.push({ label: envModel, body: { model: envModel, input } });
-  }
-
-  candidateBodies.push({ label: DEFAULT_TRACKING_MODEL, body: { model: DEFAULT_TRACKING_MODEL, input } });
-  candidateBodies.push({ label: `version:${LEGACY_SAM2_VERSION}`, body: { version: LEGACY_SAM2_VERSION, input } });
+  const versionFromEnv = Deno.env.get("FLOWRVS_REPLICATE_VERSION")?.trim();
+  const candidateVersions = [
+    ...(versionFromEnv ? [versionFromEnv] : []),
+    LEGACY_SAM2_VERSION,
+  ];
 
   const errors: string[] = [];
 
-  for (const candidate of candidateBodies) {
+  for (const version of candidateVersions) {
     try {
-      const result = await createPredictionStrict(token, candidate.body);
-      return { id: result.id, modelUsed: candidate.label };
+      const result = await createPredictionStrict(token, { version, input });
+      return { id: result.id, modelUsed: `version:${version}` };
     } catch (error) {
-      errors.push(`${candidate.label}: ${error instanceof Error ? error.message : "Unknown error"}`);
+      errors.push(`version:${version}: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   }
 
@@ -248,7 +244,7 @@ async function createPredictionStrict(
   token: string,
   body: Record<string, unknown>
 ): Promise<{ id: string }> {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 6; attempt++) {
     const response = await fetch(REPLICATE_API, {
       method: "POST",
       headers: {
@@ -268,8 +264,9 @@ async function createPredictionStrict(
 
     const text = await response.text();
 
-    if (response.status === 429 && attempt < 2) {
-      await delay(2000 * (attempt + 1));
+    if (response.status === 429 && attempt < 5) {
+      const waitSeconds = parseRetryAfterSeconds(text, attempt);
+      await delay(waitSeconds * 1000);
       continue;
     }
 
@@ -277,6 +274,19 @@ async function createPredictionStrict(
   }
 
   throw new Error("Replicate create prediction failed after retries");
+}
+
+function parseRetryAfterSeconds(payload: string, attempt: number): number {
+  try {
+    const parsed = JSON.parse(payload) as { retry_after?: number };
+    if (typeof parsed.retry_after === "number" && parsed.retry_after > 0) {
+      return Math.ceil(parsed.retry_after) + 1;
+    }
+  } catch {
+    // ignore parse errors and use exponential fallback
+  }
+
+  return Math.min(20, 2 + attempt * 2);
 }
 
 async function pollReplicateStrict(
