@@ -9,6 +9,8 @@ import { useToast } from "@/hooks/use-toast";
 
 type Mode = "choose" | "camera" | "upload" | "preview";
 
+const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
+
 export default function AvatarCreation() {
   const { setAvatar, setAvatarDbId, setCurrentStep } = useApp();
   const { toast } = useToast();
@@ -63,39 +65,68 @@ export default function AvatarCreation() {
   const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      toast({
+        title: "Invalid file type",
+        description: "Please upload a JPG or PNG image.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (file.size > MAX_IMAGE_SIZE_BYTES) {
+      toast({
+        title: "Image too large",
+        description: "Please use an image smaller than 10MB.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setImageFile(file);
     setImageUrl(URL.createObjectURL(file));
     setMode("preview");
-  }, []);
+  }, [toast]);
 
   const confirmAvatar = useCallback(async () => {
     if (!imageFile && !imageUrl) return;
     setIsCreating(true);
 
     try {
-      // Upload image to storage
       let publicUrl = imageUrl || "";
       if (imageFile) {
         publicUrl = await uploadAvatarImage(imageFile);
       }
 
-      // Call edge function to create avatar with Kling AI
       const result = await createAvatar(publicUrl, avatarName || "My Avatar");
+      const finalAvatarUrl = result.avatar_image_url || publicUrl;
 
       const avatar: Avatar = {
         id: result.avatar_id,
         name: avatarName || "My Avatar",
-        sourceImageUrl: publicUrl,
-        thumbnailUrl: publicUrl,
+        sourceImageUrl: finalAvatarUrl,
+        thumbnailUrl: finalAvatarUrl,
         createdAt: new Date(),
       };
 
       setAvatar(avatar);
       setAvatarDbId(result.avatar_id);
+
       toast({
-        title: "Avatar Created!",
-        description: "Your avatar has been processed successfully.",
+        title: "Avatar Created",
+        description: result.provider === "kling"
+          ? "Your 3D avatar is ready."
+          : "Your avatar was generated with fallback AI and is ready.",
       });
+
+      if (result.warning) {
+        toast({
+          title: "Generation note",
+          description: result.warning,
+        });
+      }
+
       setCurrentStep("upload");
     } catch (err) {
       console.error("Avatar creation error:", err);
@@ -159,6 +190,7 @@ export default function AvatarCreation() {
                   <div className="absolute inset-0 border-2 border-primary/30 rounded-xl pointer-events-none" />
                   <div className="absolute inset-x-0 h-0.5 bg-gradient-to-r from-transparent via-primary to-transparent animate-scan-line pointer-events-none" />
                 </div>
+                <p className="text-xs text-muted-foreground">Tip: face camera directly in even lighting for the best likeness.</p>
                 <div className="flex gap-3">
                   <Button variant="outline" onClick={reset} className="flex-1"><RotateCcw className="w-4 h-4 mr-2" /> Back</Button>
                   <Button onClick={capturePhoto} className="flex-1 glow-primary"><Camera className="w-4 h-4 mr-2" /> Capture</Button>
@@ -174,6 +206,7 @@ export default function AvatarCreation() {
                   <span className="text-muted-foreground">Click to upload your photo</span>
                   <span className="text-xs text-muted-foreground/60">JPG, PNG up to 10MB</span>
                 </button>
+                <p className="text-xs text-muted-foreground">Best results: single person, front-facing, clear face, no sunglasses.</p>
                 <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
                 <Button variant="outline" onClick={reset} className="w-full"><RotateCcw className="w-4 h-4 mr-2" /> Back</Button>
               </motion.div>
@@ -195,6 +228,7 @@ export default function AvatarCreation() {
                   onChange={(e) => setAvatarName(e.target.value)}
                   className="w-full px-4 py-3 rounded-lg bg-secondary border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
                 />
+                <p className="text-xs text-muted-foreground">We now run multi-provider generation with automatic fallback for fewer failures.</p>
                 <div className="flex gap-3">
                   <Button variant="outline" onClick={reset} className="flex-1" disabled={isCreating}>
                     <RotateCcw className="w-4 h-4 mr-2" /> Retake
