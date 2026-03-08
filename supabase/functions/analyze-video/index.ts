@@ -226,10 +226,9 @@ async function createPredictionWithFallback(
   input: Record<string, unknown>
 ): Promise<{ id: string; modelUsed: string }> {
   const versionFromEnv = Deno.env.get("FLOWRVS_REPLICATE_VERSION")?.trim();
-  const candidateVersions = [
-    ...(versionFromEnv ? [versionFromEnv] : []),
-    LEGACY_SAM2_VERSION,
-  ];
+  const candidateVersions = Array.from(
+    new Set([...(versionFromEnv ? [versionFromEnv] : []), ...SAM2_VERSION_CANDIDATES])
+  );
 
   const errors: string[] = [];
 
