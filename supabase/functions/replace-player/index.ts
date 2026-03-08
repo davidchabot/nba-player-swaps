@@ -8,7 +8,12 @@ const corsHeaders = {
 };
 
 const REPLICATE_API = "https://api.replicate.com/v1/predictions";
-const LEGACY_SAM2_VERSION = "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24";
+const SAM2_VERSION_CANDIDATES = [
+  "4cf1856c2e63670fa0a933b62c488d8321a5b5035215cf3e58a31904849deb7a",
+  "5c7d79c9c66166a605b9b615694c8f63649c2365670ed3558e72fbed6d9c80ef",
+  "1ca4e60cb71bd70813230d2cf10baf9c50882ddaa1f944b7c890ddbb32169221",
+  "2d72198712e0d29ac3f0330aa07f179dbdb3e76e20b3e11e2963ad1de2f85e24",
+] as const;
 const FLOWRVS_PROMPTS = [
   "the man wearing colorful shoes shoots the ball",
   "the man who is defending",
