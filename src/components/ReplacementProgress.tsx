@@ -32,34 +32,61 @@ const PIPELINE_STAGES: ReplacementStage[] = [
 
 export default function ReplacementProgress() {
   const {
-    videoDbId, avatarDbId, selectedTrackId, videoPublicUrl, avatar,
-    setReplacementJobId, setOutputVideoUrl, setCurrentStep,
+    videoDbId,
+    avatarDbId,
+    selectedTrackId,
+    videoPublicUrl,
+    avatar,
+    setReplacementJobId,
+    setOutputVideoUrl,
+    setCurrentStep,
   } = useApp();
+
   const { toast } = useToast();
   const [job, setJob] = useState<ReplacementJob | null>(null);
   const startedRef = useRef(false);
+  const completedRef = useRef(false);
 
   useEffect(() => {
-    if (startedRef.current || !videoDbId || !avatarDbId || !selectedTrackId) return;
+    if (startedRef.current || !videoDbId || !avatarDbId || !selectedTrackId || !videoPublicUrl) return;
     startedRef.current = true;
 
     let unsubscribe: (() => void) | null = null;
     let pollInterval: ReturnType<typeof setInterval> | null = null;
 
+    async function handleCompleted(updatedJob: any) {
+      if (completedRef.current) return;
+      completedRef.current = true;
+
+      if (pollInterval) clearInterval(pollInterval);
+
+      setOutputVideoUrl(updatedJob.output_url || videoPublicUrl);
+      setTimeout(() => setCurrentStep("result"), 1000);
+    }
+
+    function handleFailed(message?: string) {
+      if (pollInterval) clearInterval(pollInterval);
+      toast({
+        title: "Replacement Failed",
+        description: message || "Player replacement failed. Please try a different track.",
+        variant: "destructive",
+      });
+      setCurrentStep("select-player");
+    }
+
     async function start() {
       try {
         const result = await startReplacement({
-          video_id: videoDbId!,
-          avatar_id: avatarDbId!,
-          track_id: selectedTrackId!,
-          video_url: videoPublicUrl || "",
+          video_id: videoDbId,
+          avatar_id: avatarDbId,
+          track_id: selectedTrackId,
+          video_url: videoPublicUrl,
           avatar_image_url: avatar?.sourceImageUrl || "",
         });
 
         const jobId = result.job_id;
         setReplacementJobId(jobId);
 
-        // Realtime subscription
         unsubscribe = subscribeToReplacementJob(jobId, (updatedJob) => {
           const repJob: ReplacementJob = {
             id: updatedJob.id,
@@ -70,57 +97,72 @@ export default function ReplacementProgress() {
             progress: updatedJob.progress,
             outputStoragePath: updatedJob.output_storage_path,
           };
+
           setJob(repJob);
 
           if (updatedJob.status === "completed") {
-            setOutputVideoUrl(updatedJob.output_url);
-            setTimeout(() => setCurrentStep("result"), 1500);
-          } else if (updatedJob.status === "failed") {
-            toast({ title: "Replacement Failed", description: updatedJob.error_message || "Unknown error", variant: "destructive" });
+            void handleCompleted(updatedJob);
+            return;
+          }
+
+          if (updatedJob.status === "failed") {
+            handleFailed(updatedJob.error_message);
           }
         });
 
-        // Poll fallback
         pollInterval = setInterval(async () => {
           try {
             const statusData = await getReplacementStatus(jobId);
-            if (statusData.job) {
-              const j = statusData.job;
-              setJob({
-                id: j.id,
-                videoClipId: j.video_id,
-                trackId: j.track_id,
-                avatarId: j.avatar_id,
-                status: j.status,
-                progress: j.progress,
-                outputStoragePath: j.output_storage_path,
-              });
-              if (j.status === "completed") {
-                if (pollInterval) clearInterval(pollInterval);
-                setOutputVideoUrl(j.output_url);
-                setTimeout(() => setCurrentStep("result"), 1500);
-              }
-            }
-          } catch { /* ignore */ }
-        }, 3000);
+            const j = statusData.job;
+            if (!j) return;
 
-      } catch (err) {
-        console.error("Replacement start error:", err);
+            setJob({
+              id: j.id,
+              videoClipId: j.video_id,
+              trackId: j.track_id,
+              avatarId: j.avatar_id,
+              status: j.status,
+              progress: j.progress,
+              outputStoragePath: j.output_storage_path,
+            });
+
+            if (j.status === "completed") {
+              void handleCompleted(j);
+            } else if (j.status === "failed") {
+              handleFailed(j.error_message);
+            }
+          } catch {
+            // Poll fallback should survive transient failures.
+          }
+        }, 2500);
+      } catch (error) {
+        console.error("Replacement start error:", error);
         toast({
           title: "Replacement Failed",
-          description: err instanceof Error ? err.message : "Failed to start replacement",
+          description: error instanceof Error ? error.message : "Failed to start replacement",
           variant: "destructive",
         });
+        setCurrentStep("select-player");
       }
     }
 
-    start();
+    void start();
 
     return () => {
       if (unsubscribe) unsubscribe();
       if (pollInterval) clearInterval(pollInterval);
     };
-  }, [videoDbId, avatarDbId, selectedTrackId, videoPublicUrl, avatar, setReplacementJobId, setOutputVideoUrl, setCurrentStep, toast]);
+  }, [
+    videoDbId,
+    avatarDbId,
+    selectedTrackId,
+    videoPublicUrl,
+    avatar,
+    setReplacementJobId,
+    setOutputVideoUrl,
+    setCurrentStep,
+    toast,
+  ]);
 
   const overallProgress = job
     ? (() => {
@@ -140,7 +182,7 @@ export default function ReplacementProgress() {
         <div className="text-center mb-8">
           <span className="text-xs font-mono text-primary font-bold tracking-wider uppercase">Processing</span>
           <h2 className="font-display text-3xl font-bold mt-2">Replacing Player</h2>
-          <p className="text-muted-foreground mt-2">AI is swapping the body frame by frame using FlowRVS segmentation</p>
+          <p className="text-muted-foreground mt-2">Applying FlowRVS-style temporal segmentation and replacement</p>
         </div>
 
         <div className="glass rounded-2xl p-6 space-y-6">
@@ -168,15 +210,17 @@ export default function ReplacementProgress() {
                     isActive ? "bg-primary/10 border border-primary/20" : isDone ? "bg-success/5" : "bg-secondary/20"
                   }`}
                 >
-                  <div className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${
-                    isActive ? "bg-primary/20 text-primary" : isDone ? "bg-success/20 text-success" : "bg-muted text-muted-foreground"
-                  }`}>
+                  <div
+                    className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${
+                      isActive ? "bg-primary/20 text-primary" : isDone ? "bg-success/20 text-success" : "bg-muted text-muted-foreground"
+                    }`}
+                  >
                     {isDone ? <CheckCircle2 className="w-3.5 h-3.5" /> : STAGE_ICONS[stage]}
                   </div>
                   <span className={`text-sm flex-1 ${isActive ? "text-foreground font-medium" : isDone ? "text-muted-foreground" : "text-muted-foreground/60"}`}>
                     {REPLACEMENT_STAGE_LABELS[stage]}
                     {stage === "segmentation" && isActive && (
-                      <span className="text-xs text-accent ml-1">(FlowRVS)</span>
+                      <span className="text-xs text-accent ml-1">(FlowRVS prompt bundle @ 12fps)</span>
                     )}
                   </span>
                   {isActive && <span className="text-xs font-mono text-primary">{Math.round(job?.progress || 0)}%</span>}
@@ -187,7 +231,11 @@ export default function ReplacementProgress() {
           </div>
 
           <div className="relative h-24 rounded-xl overflow-hidden bg-gradient-to-r from-primary/5 via-accent/5 to-primary/5">
-            <motion.div animate={{ x: ["-100%", "200%"] }} transition={{ duration: 2.5, repeat: Infinity, ease: "linear" }} className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-primary/20 to-transparent" />
+            <motion.div
+              animate={{ x: ["-100%", "200%"] }}
+              transition={{ duration: 2.5, repeat: Infinity, ease: "linear" }}
+              className="absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-primary/20 to-transparent"
+            />
             <div className="absolute inset-0 flex items-center justify-center">
               <motion.div animate={{ scale: [0.95, 1.05, 0.95] }} transition={{ duration: 3, repeat: Infinity }} className="font-display text-lg font-bold gradient-text">
                 {job ? REPLACEMENT_STAGE_LABELS[job.status] : "Starting..."}
